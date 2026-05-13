@@ -17,6 +17,7 @@ pub mod mcp; // MCP (Model Context Protocol) system
 pub mod project_context; // Project context management
 pub mod remote_connect; // Remote Connect (phone → desktop)
 pub mod remote_ssh; // Remote SSH (desktop → server)
+pub mod review_platform; // Pull request review platform adapters
 pub mod runtime; // Managed runtime and capability management
 pub mod search; // Workspace search via managed flashgrep daemon
 pub mod session; // Session persistence
@@ -53,6 +54,15 @@ pub use i18n::{get_global_i18n_service, I18nConfig, I18nService, LocaleId, Local
 pub use lsp::LspManager;
 pub use mcp::MCPService;
 pub use project_context::{ContextDocumentStatus, ProjectContextConfig, ProjectContextService};
+pub use review_platform::{
+    ReviewAuthSource, ReviewAuthState, ReviewChecks, ReviewDecision, ReviewFileStatus,
+    ReviewItemState, ReviewPlatformAccount, ReviewPlatformAuthChallenge,
+    ReviewPlatformAuthChallengeState, ReviewPlatformCapabilities, ReviewPlatformCiLog,
+    ReviewPlatformCommit, ReviewPlatformError, ReviewPlatformFile, ReviewPlatformKind,
+    ReviewPlatformPullRequest, ReviewPlatformPullRequestDetail, ReviewPlatformRemote,
+    ReviewPlatformRepositoryRef, ReviewPlatformService, ReviewPlatformThread,
+    ReviewPlatformWorkspaceSnapshot,
+};
 pub use runtime::{ResolvedCommand, RuntimeCommandCapability, RuntimeManager, RuntimeSource};
 pub use search::{
     get_global_workspace_search_service, set_global_workspace_search_service, ContentSearchRequest,

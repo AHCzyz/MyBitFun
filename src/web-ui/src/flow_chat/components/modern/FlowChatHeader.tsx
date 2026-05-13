@@ -5,10 +5,12 @@
  */
 
 import React, { useEffect, useMemo, useRef, useState, useCallback } from 'react';
-import { Bot, ChevronDown, ChevronUp, List, Search, X } from 'lucide-react';
+import { Bot, ChevronDown, ChevronUp, GitPullRequest, List, Search, X } from 'lucide-react';
 import { Tooltip, IconButton, Input } from '@/component-library';
 import { useTranslation } from 'react-i18next';
 import { SessionFilesBadge } from './SessionFilesBadge';
+import { useWorkspaceContext } from '@/infrastructure/contexts/WorkspaceContext';
+import { createReviewPlatformTab } from '@/shared/utils/tabUtils';
 import './FlowChatHeader.scss';
 
 export interface FlowChatHeaderTurnSummary {
@@ -89,6 +91,7 @@ export const FlowChatHeader: React.FC<FlowChatHeaderProps> = ({
   onOpenBackgroundSubagent,
 }) => {
   const { t } = useTranslation('flow-chat');
+  const { currentWorkspace } = useWorkspaceContext();
   const [isTurnListOpen, setIsTurnListOpen] = useState(false);
   const [isSubagentListOpen, setIsSubagentListOpen] = useState(false);
   const [isSearchOpen, setIsSearchOpen] = useState(false);
@@ -248,6 +251,10 @@ export const FlowChatHeader: React.FC<FlowChatHeaderProps> = ({
     setIsSubagentListOpen(prev => !prev);
   };
 
+  const handleOpenPullRequests = useCallback(() => {
+    createReviewPlatformTab(currentWorkspace?.rootPath);
+  }, [currentWorkspace?.rootPath]);
+
   const handleTurnSelect = (turnId: string) => {
     if (!onJumpToTurn) return;
     onJumpToTurn(turnId);
@@ -374,6 +381,17 @@ export const FlowChatHeader: React.FC<FlowChatHeaderProps> = ({
           )}
         </div>
 
+        <IconButton
+          className="flowchat-header__review-platform-btn"
+          variant="ghost"
+          size="xs"
+          onClick={handleOpenPullRequests}
+          tooltip={t('flowChatHeader.pullRequests', { defaultValue: 'Pull requests' })}
+          aria-label={t('flowChatHeader.pullRequests', { defaultValue: 'Pull requests' })}
+          data-testid="flowchat-header-pull-requests"
+        >
+          <GitPullRequest size={14} />
+        </IconButton>
         {isSearchOpen ? (
           <div className="flowchat-header__search" role="search" data-testid="flowchat-header-search-bar">
             <Input

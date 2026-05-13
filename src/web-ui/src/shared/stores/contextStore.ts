@@ -157,7 +157,7 @@ export const useContextStore = create<ContextState>()(
         },
         
         partialize: (state: any) => ({ 
-          contexts: state.contexts.filter((ctx: any) => ctx.type !== 'image')
+          contexts: state.contexts.filter((ctx: any) => ctx.type !== 'image' && ctx.type !== 'pull-request')
         })
       } as any
     ),

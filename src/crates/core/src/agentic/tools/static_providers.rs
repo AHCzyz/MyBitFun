@@ -54,6 +54,7 @@ fn materialize_tool(tool_name: &str) -> Arc<dyn Tool> {
         "GetMCPPrompt" => Arc::new(GetMCPPromptTool::new()),
         "GenerativeUI" => Arc::new(GenerativeUITool::new()),
         "Git" => Arc::new(GitTool::new()),
+        "ReviewPlatform" => Arc::new(ReviewPlatformTool::new()),
         "InitMiniApp" => Arc::new(InitMiniAppTool::new()),
         "ControlHub" => Arc::new(ControlHubTool::new()),
         "ComputerUse" => Arc::new(ComputerUseTool::new()),

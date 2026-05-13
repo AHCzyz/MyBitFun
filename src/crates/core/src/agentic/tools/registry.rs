@@ -369,6 +369,7 @@ mod tests {
             "GetMCPPrompt",
             "GenerativeUI",
             "Git",
+            "ReviewPlatform",
             "InitMiniApp",
             "ControlHub",
             "ComputerUse",
@@ -526,6 +527,7 @@ mod tests {
         assert!(registry.is_tool_collapsed("GetFileDiff"));
         assert!(!registry.is_tool_collapsed("GetToolSpec"));
         assert!(registry.is_tool_collapsed("Git"));
+        assert!(registry.is_tool_collapsed("ReviewPlatform"));
     }
 
     #[test]
@@ -550,6 +552,7 @@ mod tests {
                 "GetMCPPrompt",
                 "GenerativeUI",
                 "Git",
+                "ReviewPlatform",
                 "InitMiniApp",
                 "ControlHub",
                 "ComputerUse",
