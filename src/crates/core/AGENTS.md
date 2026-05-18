@@ -32,8 +32,9 @@ SessionManager → Session → DialogTurn → ModelRound
   product runtime assembly point. New modules should prefer the extracted owner
   crate listed in `docs/architecture/core-decomposition.md`.
 - For tools, keep lightweight contracts, pure manifest/exposure contracts, and
-  generic registry/provider container logic in `bitfun-agent-tools`. Core tool
-  runtime should assemble product tools, adapt `dyn Tool`, apply snapshot
+  generic registry / static-provider / dynamic-provider container contracts in
+  `bitfun-agent-tools`. Core tool runtime should assemble product tool
+  providers in `static_providers.rs`, adapt `dyn Tool`, apply snapshot
   decoration, and own runtime manifest assembly / context filtering plus
   on-demand spec discovery execution (`GetToolSpec`) for now.
 - Keep `ToolUseContext` and concrete tool implementations in core unless a

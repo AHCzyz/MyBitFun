@@ -13,6 +13,7 @@ pub mod pipeline;
 pub(crate) mod post_call_hooks;
 pub mod registry;
 pub mod restrictions;
+pub(crate) mod static_providers;
 pub mod user_input_manager;
 pub mod workspace_paths;
 pub use bitfun_agent_tools::input_validator;

@@ -1,7 +1,7 @@
 //! Tool registry
 
 use crate::agentic::tools::framework::{DynamicToolInfo, Tool, ToolExposure};
-use crate::agentic::tools::implementations::*;
+use crate::agentic::tools::static_providers::builtin_static_tool_providers;
 use crate::util::errors::BitFunResult;
 use bitfun_agent_tools::{
     DynamicToolDescriptor, DynamicToolProvider, PortResult, ToolDecorator,
@@ -132,71 +132,9 @@ impl ToolRegistry {
 
     /// Register all tools
     fn register_all_tools(&mut self) {
-        // Basic tool set
-        self.register_tool(Arc::new(LSTool::new()));
-        self.register_tool(Arc::new(FileReadTool::new()));
-        self.register_tool(Arc::new(GlobTool::new()));
-        self.register_tool(Arc::new(GrepTool::new()));
-        self.register_tool(Arc::new(FileWriteTool::new()));
-        self.register_tool(Arc::new(FileEditTool::new()));
-        self.register_tool(Arc::new(DeleteFileTool::new()));
-        self.register_tool(Arc::new(BashTool::new()));
-        // TaskTool, execute subagent
-        self.register_tool(Arc::new(TaskTool::new()));
-        // Skill tool
-        self.register_tool(Arc::new(SkillTool::new()));
-        // AskUserQuestion tool
-        self.register_tool(Arc::new(AskUserQuestionTool::new()));
-        // TodoWrite tool
-        self.register_tool(Arc::new(TodoWriteTool::new()));
-        // CreatePlan tool
-        self.register_tool(Arc::new(CreatePlanTool::new()));
-        // Code review submit tool
-        self.register_tool(Arc::new(CodeReviewTool::new()));
-
-        // GetToolSpec — the discovery entry point for collapsed tools.
-        self.register_tool(Arc::new(GetToolSpecTool::new()));
-
-        // GetFileDiff tool
-        self.register_tool(Arc::new(GetFileDiffTool::new()));
-        // Log tool (debug mode only)
-        self.register_tool(Arc::new(LogTool::new()));
-
-        // TerminalControl is now accessible via ControlHub's "terminal" domain,
-        // but we keep it registered separately for backward compatibility.
-        self.register_tool(Arc::new(TerminalControlTool::new()));
-
-        self.register_tool(Arc::new(SessionControlTool::new()));
-        self.register_tool(Arc::new(SessionMessageTool::new()));
-        self.register_tool(Arc::new(SessionHistoryTool::new()));
-
-        // Cron scheduled jobs tool
-        self.register_tool(Arc::new(CronTool::new()));
-
-        // Web tool
-        self.register_tool(Arc::new(WebSearchTool::new()));
-        self.register_tool(Arc::new(WebFetchTool::new()));
-
-        self.register_tool(Arc::new(ListMCPResourcesTool::new()));
-        self.register_tool(Arc::new(ReadMCPResourceTool::new()));
-        self.register_tool(Arc::new(ListMCPPromptsTool::new()));
-        self.register_tool(Arc::new(GetMCPPromptTool::new()));
-
-        self.register_tool(Arc::new(GenerativeUITool::new()));
-
-        // Git version control tool
-        self.register_tool(Arc::new(GitTool::new()));
-
-        // MiniApp Agent tool (single InitMiniApp)
-        self.register_tool(Arc::new(InitMiniAppTool::new()));
-
-        // ControlHub — unified browser/terminal/meta control entry point.
-        // Local desktop and OS/system Computer Use is exposed as a dedicated tool.
-        self.register_tool(Arc::new(ControlHubTool::new()));
-        self.register_tool(Arc::new(ComputerUseTool::new()));
-
-        // Playbook — predefined step-by-step operation guides for common tasks.
-        self.register_tool(Arc::new(PlaybookTool::new()));
+        for provider in builtin_static_tool_providers() {
+            self.inner.install_static_provider(&provider);
+        }
     }
 
     /// Register a single tool
@@ -285,8 +223,9 @@ mod tests {
     use crate::agentic::tools::framework::{
         DynamicMcpToolInfo, DynamicToolInfo, Tool, ToolResult, ToolUseContext, ValidationResult,
     };
+    use crate::agentic::tools::static_providers::builtin_static_tool_providers;
     use async_trait::async_trait;
-    use bitfun_agent_tools::DynamicToolProvider;
+    use bitfun_agent_tools::{DynamicToolProvider, StaticToolProvider};
     use serde_json::Value;
     use serde_json::json;
     use std::sync::Arc;
@@ -444,6 +383,40 @@ mod tests {
             runtime_names,
             registry.get_tool_names(),
             "runtime tool collection order must match registry key order"
+        );
+    }
+
+    #[test]
+    fn builtin_static_tool_providers_cover_registry_manifest_in_order() {
+        let provider_tools = builtin_static_tool_providers()
+            .into_iter()
+            .flat_map(|provider| provider.tools())
+            .map(|tool| tool.name().to_string())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            provider_tools,
+            create_tool_registry().get_tool_names(),
+            "provider-based assembly must preserve the existing builtin registry order"
+        );
+    }
+
+    #[test]
+    fn builtin_static_tool_providers_keep_owner_group_order() {
+        let provider_ids = builtin_static_tool_providers()
+            .into_iter()
+            .map(|provider| provider.provider_id())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            provider_ids,
+            vec![
+                "core.basic",
+                "core.agent",
+                "core.session",
+                "core.integration"
+            ],
+            "provider groups must stay stable until concrete tool-pack owners exist"
         );
     }
 

@@ -6,8 +6,8 @@ use bitfun_agent_tools::{
     sort_tool_manifest_definitions,
 };
 use bitfun_agent_tools::{
-    DynamicToolDescriptor, DynamicToolProvider, PortResult, ToolDecorator, ToolRegistry,
-    ToolRegistryItem,
+    DynamicToolDescriptor, DynamicToolProvider, PortResult, StaticToolProvider, ToolDecorator,
+    ToolRegistry, ToolRegistryItem,
 };
 use serde_json::json;
 use std::path::PathBuf;
@@ -402,6 +402,7 @@ fn tool_manifest_sorting_preserves_prompt_visible_order() {
     );
 }
 
+#[derive(Clone)]
 struct RegistryMarkerTool {
     name: String,
     provider_id: Option<String>,
@@ -441,6 +442,68 @@ fn registry_marker_tool(name: &str, provider_id: Option<&str>) -> Arc<RegistryMa
         name: name.to_string(),
         provider_id: provider_id.map(str::to_string),
     })
+}
+
+struct RegistryMarkerProvider {
+    provider_id: &'static str,
+    tools: Vec<Arc<RegistryMarkerTool>>,
+}
+
+impl StaticToolProvider<RegistryMarkerTool> for RegistryMarkerProvider {
+    fn provider_id(&self) -> &'static str {
+        self.provider_id
+    }
+
+    fn tools(&self) -> Vec<Arc<RegistryMarkerTool>> {
+        self.tools.clone()
+    }
+}
+
+struct RegistryMarkerDecorator;
+
+impl ToolDecorator<Arc<RegistryMarkerTool>> for RegistryMarkerDecorator {
+    fn decorate(&self, tool: Arc<RegistryMarkerTool>) -> Arc<RegistryMarkerTool> {
+        Arc::new(RegistryMarkerTool {
+            name: format!("decorated_{}", tool.name),
+            provider_id: tool.provider_id.clone(),
+        })
+    }
+}
+
+#[test]
+fn generic_tool_registry_installs_static_provider_in_order() {
+    let mut registry = ToolRegistry::new();
+    let provider = RegistryMarkerProvider {
+        provider_id: "core-basic",
+        tools: vec![
+            registry_marker_tool("Read", None),
+            registry_marker_tool("Write", None),
+        ],
+    };
+
+    registry.install_static_provider(&provider);
+
+    assert_eq!(provider.provider_id(), "core-basic");
+    assert_eq!(
+        registry.get_tool_names(),
+        vec!["Read".to_string(), "Write".to_string()]
+    );
+}
+
+#[test]
+fn generic_tool_registry_applies_decorator_to_static_provider_tools() {
+    let mut registry = ToolRegistry::with_tool_decorator(Arc::new(RegistryMarkerDecorator));
+    let provider = RegistryMarkerProvider {
+        provider_id: "decorated-provider",
+        tools: vec![registry_marker_tool("Read", None)],
+    };
+
+    registry.install_static_provider(&provider);
+
+    assert_eq!(
+        registry.get_tool_names(),
+        vec!["decorated_Read".to_string()]
+    );
 }
 
 #[tokio::test]

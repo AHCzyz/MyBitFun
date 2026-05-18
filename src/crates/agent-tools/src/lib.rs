@@ -11,7 +11,7 @@ pub use bitfun_runtime_ports::{
     DynamicToolDescriptor, DynamicToolProvider, PortError, PortErrorKind, PortResult, ToolDecorator,
 };
 pub use framework::{
-    DynamicMcpToolInfo, DynamicToolInfo, GET_TOOL_SPEC_TOOL_NAME, ToolExposure,
+    DynamicMcpToolInfo, DynamicToolInfo, GET_TOOL_SPEC_TOOL_NAME, StaticToolProvider, ToolExposure,
     ToolManifestDefinition, ToolManifestPolicyResolution, ToolManifestPolicyTool, ToolPathBackend,
     ToolPathOperation, ToolPathPolicy, ToolPathResolution, ToolRef, ToolRegistry, ToolRegistryItem,
     ToolRenderOptions, ToolRestrictionError, ToolResult, ToolRuntimeRestrictions, ValidationResult,

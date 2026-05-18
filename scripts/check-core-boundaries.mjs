@@ -1138,15 +1138,15 @@ const requiredContentRules = [
   {
     path: 'src/crates/core/src/agentic/tools/registry.rs',
     reason:
-      'core must continue owning product tool registry assembly until an approved product-provider migration exists',
+      'core must continue installing product tool providers until portable tool context and concrete tool-pack migration exist',
     patterns: [
+      {
+        regex: /\binstall_static_provider\b/,
+        message: 'missing provider-based registry installation',
+      },
       {
         regex: /\bfn register_all_tools\b/,
         message: 'missing product tool registration owner',
-      },
-      {
-        regex: /\bGetToolSpecTool::new\(\)/,
-        message: 'missing GetToolSpec registration anchor',
       },
       {
         regex: /\bget_collapsed_tool_names\b/,
@@ -1155,6 +1155,55 @@ const requiredContentRules = [
       {
         regex: /\bToolExposure::Collapsed\b/,
         message: 'missing collapsed exposure lookup',
+      },
+    ],
+  },
+  {
+    path: 'src/crates/core/src/agentic/tools/static_providers.rs',
+    reason:
+      'core owns builtin product tool provider groups until concrete tool-pack migration exists',
+    patterns: [
+      {
+        regex: /\bbuiltin_static_tool_providers\b/,
+        message: 'missing builtin static tool provider owner',
+      },
+      {
+        regex: /\bStaticToolProvider\b/,
+        message: 'missing static provider contract use',
+      },
+      {
+        regex: /core\.basic/,
+        message: 'missing core basic tool provider group',
+      },
+      {
+        regex: /core\.agent/,
+        message: 'missing core agent tool provider group',
+      },
+      {
+        regex: /core\.session/,
+        message: 'missing core session tool provider group',
+      },
+      {
+        regex: /core\.integration/,
+        message: 'missing core integration tool provider group',
+      },
+      {
+        regex: /\bGetToolSpecTool::new\(\)/,
+        message: 'missing GetToolSpec registration anchor',
+      },
+    ],
+  },
+  {
+    path: 'src/crates/agent-tools/src/framework.rs',
+    reason: 'agent-tools owns generic registry and static provider installation contracts',
+    patterns: [
+      {
+        regex: /\bpub trait StaticToolProvider\b/,
+        message: 'missing static tool provider contract',
+      },
+      {
+        regex: /\bpub fn install_static_provider\b/,
+        message: 'missing static provider registry installer',
       },
     ],
   },
@@ -2662,7 +2711,27 @@ function runManifestParserSelfTest() {
     },
     {
       path: 'src/crates/core/src/agentic/tools/registry.rs',
-      contracts: ['register_all_tools', 'GetToolSpecTool', 'get_collapsed_tool_names'],
+      contracts: [
+        'install_static_provider',
+        'register_all_tools',
+        'get_collapsed_tool_names',
+      ],
+    },
+    {
+      path: 'src/crates/core/src/agentic/tools/static_providers.rs',
+      contracts: [
+        'builtin_static_tool_providers',
+        'StaticToolProvider',
+        'core.basic',
+        'core.agent',
+        'core.session',
+        'core.integration',
+        'GetToolSpecTool',
+      ],
+    },
+    {
+      path: 'src/crates/agent-tools/src/framework.rs',
+      contracts: ['StaticToolProvider', 'install_static_provider'],
     },
     {
       path: 'src/crates/core/src/agentic/tools/manifest_resolver.rs',

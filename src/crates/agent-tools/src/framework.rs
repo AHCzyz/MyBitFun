@@ -217,6 +217,12 @@ impl<Tool> ToolDecorator<Tool> for IdentityToolDecorator {
 pub type ToolRef<Tool> = Arc<Tool>;
 pub type ToolDecoratorRef<Tool> = Arc<dyn ToolDecorator<ToolRef<Tool>>>;
 
+pub trait StaticToolProvider<Tool: ?Sized>: Send + Sync {
+    fn provider_id(&self) -> &'static str;
+
+    fn tools(&self) -> Vec<ToolRef<Tool>>;
+}
+
 pub struct ToolRegistry<Tool: ToolRegistryItem + ?Sized> {
     tools: IndexMap<String, ToolRef<Tool>>,
     dynamic_tools: IndexMap<String, DynamicToolMetadata>,
@@ -265,6 +271,15 @@ impl<Tool: ToolRegistryItem + ?Sized> ToolRegistry<Tool> {
             self.dynamic_tools.shift_remove(&name);
         }
         self.tools.insert(name, tool);
+    }
+
+    pub fn install_static_provider<Provider>(&mut self, provider: &Provider)
+    where
+        Provider: StaticToolProvider<Tool> + ?Sized,
+    {
+        for tool in provider.tools() {
+            self.register_tool(tool);
+        }
     }
 
     pub fn unregister_mcp_server_tools(&mut self, server_id: &str) {
