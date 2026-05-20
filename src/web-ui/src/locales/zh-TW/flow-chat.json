@@ -200,6 +200,7 @@
       "input": "輸入",
       "output": "輸出",
       "cached": "快取",
+      "hitRate": "命中率",
       "duration": "記錄耗時",
       "p95": "P95",
       "execution": "執行",

@@ -234,6 +234,7 @@
       "input": "Input",
       "output": "Output",
       "cached": "Cached",
+      "hitRate": "Hit rate",
       "duration": "Recorded time",
       "p95": "P95",
       "execution": "Execution",
