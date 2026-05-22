@@ -1,8 +1,6 @@
 //! Agentic Mode
 
-use crate::agentic::agents::{
-    shared_coding_mode_tools, Agent, SHARED_CODING_MODE_PROMPT_TEMPLATE,
-};
+use crate::agentic::agents::{shared_coding_mode_tools, Agent, SHARED_CODING_MODE_PROMPT_TEMPLATE};
 use async_trait::async_trait;
 pub struct AgenticMode {
     default_tools: Vec<String>,

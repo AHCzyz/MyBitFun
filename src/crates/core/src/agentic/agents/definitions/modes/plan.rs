@@ -32,7 +32,6 @@ impl PlanMode {
             ],
         }
     }
-
 }
 
 #[async_trait]

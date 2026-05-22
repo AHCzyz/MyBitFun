@@ -122,10 +122,7 @@ fn non_deep_review_builtin_subagents_default_to_primary() {
 
 #[test]
 fn general_purpose_builtin_subagent_defaults_to_fast() {
-    assert_eq!(
-        default_model_id_for_builtin_agent("GeneralPurpose"),
-        "fast"
-    );
+    assert_eq!(default_model_id_for_builtin_agent("GeneralPurpose"), "fast");
 }
 
 #[test]

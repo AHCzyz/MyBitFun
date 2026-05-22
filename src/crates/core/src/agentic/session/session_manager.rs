@@ -2554,6 +2554,102 @@ impl SessionManager {
         Ok(turn_id)
     }
 
+    /// Append a completed local command turn that should be persisted in user-facing
+    /// history without entering model-visible runtime context.
+    pub async fn append_completed_local_command_turn(
+        &self,
+        session_id: &str,
+        content: String,
+        turn_id: Option<String>,
+        timestamp_ms: Option<u64>,
+        user_message_metadata: Option<serde_json::Value>,
+    ) -> BitFunResult<DialogTurnData> {
+        let session = self
+            .get_session(session_id)
+            .ok_or_else(|| BitFunError::NotFound(format!("Session not found: {}", session_id)))?;
+        let workspace_path = Self::effective_workspace_path_from_config(&session.config)
+            .await
+            .ok_or_else(|| {
+                BitFunError::Validation(format!(
+                    "Session workspace_path is missing: {}",
+                    session_id
+                ))
+            })?;
+
+        let turn_id = new_turn_id(turn_id);
+        let turn_index = session
+            .dialog_turn_ids
+            .iter()
+            .position(|existing| existing == &turn_id)
+            .unwrap_or(session.dialog_turn_ids.len());
+        let timestamp = timestamp_ms.unwrap_or_else(|| {
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64
+        });
+        let mut turn = DialogTurnData::new_with_kind(
+            DialogTurnKind::LocalCommand,
+            turn_id.clone(),
+            turn_index,
+            session_id.to_string(),
+            None,
+            UserMessageData {
+                id: format!("{}-user", turn_id),
+                content,
+                timestamp,
+                metadata: user_message_metadata,
+            },
+        );
+        turn.timestamp = timestamp;
+        turn.start_time = timestamp;
+        turn.end_time = Some(timestamp);
+        turn.duration_ms = Some(0);
+        turn.status = TurnStatus::Completed;
+
+        if self.config.enable_persistence && Self::should_persist_session(&session) {
+            self.persistence_manager
+                .save_dialog_turn(&workspace_path, &turn)
+                .await?;
+        }
+
+        let session_snapshot = if let Some(mut session) = self.sessions.get_mut(session_id) {
+            if !session
+                .dialog_turn_ids
+                .iter()
+                .any(|existing| existing == &turn_id)
+            {
+                session.dialog_turn_ids.push(turn_id);
+            }
+            session.state = SessionState::Idle;
+            session.updated_at = SystemTime::now();
+            session.last_activity_at = SystemTime::now();
+
+            if self.config.enable_persistence && Self::should_persist_session(&session) {
+                Some(session.clone())
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        if let Some(session) = session_snapshot {
+            self.persistence_manager
+                .save_session(&workspace_path, &session)
+                .await?;
+        }
+
+        self.persist_context_snapshot_for_turn_best_effort(
+            session_id,
+            turn_index,
+            "local_command_turn_persisted",
+        )
+        .await;
+
+        Ok(turn)
+    }
+
     /// Complete dialog turn
     pub async fn complete_dialog_turn(
         &self,
@@ -3475,8 +3571,9 @@ mod tests {
     };
     use crate::service::remote_ssh::workspace_state::local_workspace_roots_equal;
     use crate::service::session::{
-        DialogTurnData, ModelRoundData, SessionKind, SessionMetadata, SessionRelationship,
-        SessionRelationshipKind, ToolCallData, ToolItemData, ToolResultData, UserMessageData,
+        DialogTurnData, DialogTurnKind, ModelRoundData, SessionKind, SessionMetadata,
+        SessionRelationship, SessionRelationshipKind, ToolCallData, ToolItemData, ToolResultData,
+        TurnStatus, UserMessageData,
     };
     use dashmap::try_result::TryResult;
     use serde_json::json;
@@ -3770,6 +3867,67 @@ mod tests {
             .expect("session should remain available");
         assert!(updated);
         assert!(matches!(session.state, SessionState::Idle));
+    }
+
+    #[tokio::test]
+    async fn append_completed_local_command_turn_persists_without_model_context() {
+        let workspace = TestWorkspace::new();
+        let persistence_manager = Arc::new(
+            PersistenceManager::new(workspace.path_manager()).expect("persistence manager"),
+        );
+        let manager = test_manager(persistence_manager.clone());
+        let session = manager
+            .create_session(
+                "Usage session".to_string(),
+                "agent".to_string(),
+                SessionConfig {
+                    workspace_path: Some(workspace.path().to_string_lossy().to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("session should create");
+
+        let turn = manager
+            .append_completed_local_command_turn(
+                &session.session_id,
+                "# Session Usage Report".to_string(),
+                Some("local-usage-1".to_string()),
+                Some(42),
+                Some(json!({
+                    "localCommandKind": "usage_report",
+                    "modelVisible": false,
+                })),
+            )
+            .await
+            .expect("local command turn should persist");
+
+        assert_eq!(turn.kind, DialogTurnKind::LocalCommand);
+        assert_eq!(turn.status, TurnStatus::Completed);
+
+        let active = manager
+            .get_session(&session.session_id)
+            .expect("session should remain active");
+        assert_eq!(active.dialog_turn_ids, vec!["local-usage-1".to_string()]);
+        assert!(manager
+            .context_store
+            .get_context_messages(&session.session_id)
+            .is_empty());
+
+        let persisted_turns = persistence_manager
+            .load_session_turns(workspace.path(), &session.session_id)
+            .await
+            .expect("turns should load");
+        assert_eq!(persisted_turns.len(), 1);
+        assert_eq!(persisted_turns[0].kind, DialogTurnKind::LocalCommand);
+        assert!(SessionManager::build_messages_from_turns(&persisted_turns).is_empty());
+
+        let metadata = persistence_manager
+            .load_session_metadata(workspace.path(), &session.session_id)
+            .await
+            .expect("metadata should load")
+            .expect("metadata should exist");
+        assert_eq!(metadata.turn_count, 1);
     }
 
     #[tokio::test]

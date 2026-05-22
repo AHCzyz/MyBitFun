@@ -58,8 +58,7 @@ pub use persistence::PersistenceManager;
 pub use round_preempt::{
     DialogRoundInjectionInterrupt, DialogRoundInjectionSource, DialogRoundPreemptSource,
     NoopDialogRoundInjectionSource, NoopDialogRoundPreemptSource, RoundInjection,
-    RoundInjectionKind, RoundInjectionTarget, SessionRoundInjectionBuffer,
-    SessionRoundYieldFlags,
+    RoundInjectionKind, RoundInjectionTarget, SessionRoundInjectionBuffer, SessionRoundYieldFlags,
 };
 pub use session::*;
 pub use side_question::*;
