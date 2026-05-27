@@ -269,10 +269,10 @@ function handleEarlyDetected(
 ): void {
   flushPendingBatchedEvents(context);
 
-  // AskUserQuestion cards are rendered by the streaming engine before the tool
-  // is validated. When a stream retry regenerates the question after a parse
-  // failure, the previous card lingers. Remove any previously failed
-  // AskUserQuestion cards from all rounds so the retry replaces them cleanly.
+  // AskUserQuestion cards are rendered by the streaming engine before tool
+  // arguments are parsed and validated. When a stream retry regenerates the
+  // question after that specific failure class, remove the stale failed card
+  // while preserving real user-cancelled or otherwise failed questions.
   if (toolEvent.tool_name === 'AskUserQuestion') {
     store.updateDialogTurn(sessionId, turnId, (turn) => ({
       ...turn,
@@ -280,12 +280,7 @@ function handleEarlyDetected(
         ...round,
         items: round.items.filter(
           (item: FlowItem) =>
-            !(
-              item.type === 'tool' &&
-              (item as FlowToolItem).toolName === 'AskUserQuestion' &&
-              ((item as FlowToolItem).status === 'error' ||
-                (item as FlowToolItem).status === 'cancelled')
-            ),
+            !isStaleAskUserQuestionRetryCard(item),
         ),
       })),
     }));
@@ -320,6 +315,25 @@ function handleEarlyDetected(
 
   store.addModelRoundItem(sessionId, turnId, preparingToolItem, roundId);
   applyPendingAcpPermissionForTool(store, toolEvent.tool_id);
+}
+
+function isStaleAskUserQuestionRetryCard(item: FlowItem): boolean {
+  if (item.type !== 'tool') {
+    return false;
+  }
+
+  const toolItem = item as FlowToolItem;
+  if (toolItem.toolName !== 'AskUserQuestion' || toolItem.status !== 'error') {
+    return false;
+  }
+
+  const error = toolItem.toolResult?.error || '';
+  return (
+    error.includes('Arguments are invalid JSON') ||
+    error.includes('Tool arguments were truncated by the model') ||
+    error.includes('Failed to parse input parameters') ||
+    /^Question \d+ /.test(error)
+  );
 }
 
 /**
