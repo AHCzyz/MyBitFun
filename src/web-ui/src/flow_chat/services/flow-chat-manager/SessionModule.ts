@@ -759,6 +759,7 @@ export async function ensureBackendSession(
         resolveSessionTitle(latestSession, (key, options) => i18nService.t(key, options)) ||
         `Session ${sessionId.slice(0, 8)}`,
       agentType: latestSession.mode || 'agentic',
+      runtimeId: latestSession.runtimeId,
       workspacePath,
       workspaceId: latestSession.workspaceId,
       remoteConnectionId: effectiveConnectionId,
@@ -800,6 +801,7 @@ export async function retryCreateBackendSession(
       resolveSessionTitle(session, (key, options) => i18nService.t(key, options)) ||
       `Session ${sessionId.slice(0, 8)}`,
     agentType: session.mode || 'agentic',
+    runtimeId: session.runtimeId,
     workspacePath,
     workspaceId: session.workspaceId,
     remoteConnectionId: session.remoteConnectionId,

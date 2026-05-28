@@ -8,3 +8,5 @@ export { RichTextInput, type MentionState } from './RichTextInput';
 export { ModelSelector } from './ModelSelector';
 
 export * from './toolbar-mode';
+export { RuntimeSelector } from './RuntimeSelector';
+export type { RuntimeSelectorProps } from './RuntimeSelector';

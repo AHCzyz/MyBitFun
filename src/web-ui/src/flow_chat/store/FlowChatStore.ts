@@ -505,6 +505,33 @@ export class FlowChatStore {
   }
 
   /**
+   * Update the agent runtime selection for a session.
+   * This is a session-level preference that persists across switches.
+   */
+  public updateSessionRuntimeId(sessionId: string, runtimeId: string): void {
+    this.setState(prev => {
+      const session = prev.sessions.get(sessionId);
+      if (!session) return prev;
+
+      if (session.runtimeId === runtimeId) return prev;
+
+      const updatedSession = {
+        ...session,
+        runtimeId,
+        lastActiveAt: Date.now()
+      };
+
+      const newSessions = new Map(prev.sessions);
+      newSessions.set(sessionId, updatedSession);
+
+      return {
+        ...prev,
+        sessions: newSessions
+      };
+    });
+  }
+
+  /**
    * Record the mode used by the most recent user submission accepted by the runtime.
    * Unlike `lastUserDialogMode`, this does not rewind when history is rolled back.
    */
@@ -2506,6 +2533,7 @@ export class FlowChatStore {
           contextRestoreState,
           error: null,
           mode: restoredSessionInfo?.agentType || session.mode,
+          runtimeId: restoredSessionInfo?.runtimeId ?? session.runtimeId,
           lastUserDialogMode: restoredLastUserDialogMode,
           lastSubmittedMode:
             restoredSessionInfo?.lastSubmittedAgentType ?? session.lastSubmittedMode,

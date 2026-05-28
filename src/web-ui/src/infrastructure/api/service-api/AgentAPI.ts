@@ -47,6 +47,7 @@ export interface CreateSessionRequest {
   remoteSshHost?: string;
   sessionKind?: 'standard' | 'subagent';
   relationship?: SessionRelationship;
+  runtimeId?: string;
   deepReviewRunManifest?: ReviewTeamRunManifest;
   config?: SessionConfig;
 }
@@ -96,6 +97,8 @@ export interface SessionInfo {
   state: string;
   turnCount: number;
   createdAt: number;
+  /** Agent runtime selection (e.g. 'bitfun', 'omp', 'claude'). */
+  runtimeId?: string;
 }
 
 export interface RestoreSessionWithTurnsResponse {
@@ -143,6 +146,11 @@ export interface UpdateSessionModelRequest {
   modelName: string;
 }
 
+export interface UpdateSessionRuntimeRequest {
+  sessionId: string;
+  runtimeId: string;
+}
+
 export interface UpdateSessionTitleRequest {
   sessionId: string;
   title: string;
@@ -164,9 +172,6 @@ export interface ModeInfo {
    * share the same key can reuse the same session-level prompt cache.
    */
   promptCacheScopeKey: string;
-  configProfileId: string;
-  configProfileLabel?: string;
-  configProfileMemberModeIds: string[];
 }
 
 
@@ -542,6 +547,14 @@ export class AgentAPI {
     }
   }
 
+  async updateSessionRuntime(request: UpdateSessionRuntimeRequest): Promise<void> {
+    try {
+      await api.invoke<void>('update_session_runtime', { request });
+    } catch (error) {
+      throw createTauriCommandError('update_session_runtime', error, request);
+    }
+  }
+
   async updateSessionTitle(request: UpdateSessionTitleRequest): Promise<string> {
     try {
       return await api.invoke<string>('update_session_title', { request });
@@ -807,8 +820,6 @@ export class AgentAPI {
       isReadonly: false,
       toolCount: 0,
       promptCacheScopeKey: agentType,
-      configProfileId: agentType,
-      configProfileMemberModeIds: [agentType],
       agent_type: agentType,
       when_to_use: `Use ${agentType} for related tasks`,
       tools: 'all',

@@ -72,3 +72,4 @@ tests/e2e/reports/
 ASSETS_LICENSES.md
 
 external/
+resources/omp/*.exe

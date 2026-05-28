@@ -5,10 +5,15 @@ use std::sync::Arc;
 use anyhow::Result;
 use log::info;
 
+use bitfun_runtime_ports::registry::{init_global_runtime_registry, RuntimeRegistry};
+
 use crate::agentic::coordination;
 use crate::agentic::events;
 use crate::agentic::execution;
 use crate::agentic::persistence;
+use crate::agentic::runtime_adapters::bitfun_runtime::BitfunRuntime;
+use crate::agentic::runtime_adapters::claude_runtime::ClaudeRuntime;
+use crate::agentic::runtime_adapters::omp_runtime::OmpRuntime;
 use crate::agentic::session;
 use crate::agentic::tools;
 use crate::infrastructure::ai::AIClientFactory;
@@ -98,11 +103,19 @@ pub async fn init_agentic_system() -> Result<AgenticSystem> {
         }
     });
 
-    info!("Agentic system initialization complete");
-
-    Ok(AgenticSystem {
-        coordinator,
+    let agentic_system = AgenticSystem {
+        coordinator: coordinator.clone(),
         event_queue,
         token_usage_service,
-    })
+    };
+
+    // Register runtime adapters in the global registry
+    let mut registry = RuntimeRegistry::new();
+    registry.register(Arc::new(BitfunRuntime::new(Arc::new(agentic_system.clone()))));
+    registry.register(Arc::new(OmpRuntime::new()));
+    registry.register(Arc::new(ClaudeRuntime::new()));
+    init_global_runtime_registry(registry);
+    info!("Agent runtime registry initialized with {} runtimes", 3);
+
+    Ok(agentic_system)
 }

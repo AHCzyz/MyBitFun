@@ -80,6 +80,13 @@ pub struct UpdateSessionModelRequest {
     pub model_name: String,
 }
 
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateSessionRuntimeRequest {
+    pub session_id: String,
+    pub runtime_id: String,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UpdateSessionTitleRequest {
@@ -209,6 +216,8 @@ pub struct SessionResponse {
     pub state: String,
     pub turn_count: usize,
     pub created_at: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -590,6 +599,7 @@ pub async fn create_session(
             remote_connection_id: remote_conn.clone(),
             remote_ssh_host: remote_ssh_host.clone(),
             model_id: c.model_name,
+            runtime_id: None,
         })
         .unwrap_or(SessionConfig {
             workspace_path: Some(request.workspace_path.clone()),
@@ -656,6 +666,17 @@ pub async fn update_session_model(
         .update_session_model(&request.session_id, &request.model_name)
         .await
         .map_err(|e| format!("Failed to update session model: {}", e))
+}
+
+#[tauri::command]
+pub async fn update_session_runtime(
+    coordinator: State<'_, Arc<ConversationCoordinator>>,
+    request: UpdateSessionRuntimeRequest,
+) -> Result<(), String> {
+    coordinator
+        .update_session_runtime(&request.session_id, &request.runtime_id)
+        .await
+        .map_err(|e| format!("Failed to update session runtime: {}", e))
 }
 
 #[tauri::command]
@@ -1469,6 +1490,7 @@ pub async fn list_sessions(
             state: format!("{:?}", summary.state),
             turn_count: summary.turn_count,
             created_at: system_time_to_unix_secs(summary.created_at),
+            runtime_id: None,
         })
         .collect();
 
@@ -1628,6 +1650,7 @@ fn session_to_response(session: Session) -> SessionResponse {
         state: format!("{:?}", session.state),
         turn_count: session.dialog_turn_ids.len(),
         created_at: system_time_to_unix_secs(session.created_at),
+        runtime_id: session.config.runtime_id.clone(),
     }
 }
 

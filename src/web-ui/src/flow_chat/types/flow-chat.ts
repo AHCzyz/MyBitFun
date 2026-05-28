@@ -321,6 +321,11 @@ export interface Session {
    */
   mode?: string;
   /**
+   * Agent runtime selection for this session (e.g. 'bitfun', 'omp', 'claude').
+   * Locked once the first message is sent. Persists across session switches.
+   */
+  runtimeId?: string;
+  /**
    * Mode of the last surviving user dialog turn in the current session
    * history. Rollback and turn truncation should follow this value.
    */

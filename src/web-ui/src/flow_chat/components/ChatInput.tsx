@@ -19,6 +19,7 @@ import {
 } from '../hooks/useSessionStateMachine';
 import { SessionExecutionEvent } from '../state-machine/types';
 import { ModelSelector } from './ModelSelector';
+import { RuntimeSelector } from './RuntimeSelector';
 import { FlowChatStore } from '../store/FlowChatStore';
 import type { FlowChatState, Session } from '../types/flow-chat';
 import type { FileContext, DirectoryContext, ImageContext } from '@/types/context.ts';
@@ -300,6 +301,38 @@ export const ChatInput: React.FC<ChatInputProps> = ({
   const currentReviewActivity = useSessionReviewActivity(currentSessionId);
   useSessionStateMachine(effectiveTargetSessionId);
   const { confirmDeepReviewLaunch, deepReviewConsentDialog } = useDeepReviewConsent();
+
+  // Runtime selector state - locked once session has dialog turns
+  const [selectedRuntimeId, setSelectedRuntimeId] = useState<string | null>(null);
+  const hasDialogTurns = Boolean(effectiveTargetSession?.dialogTurns?.length);
+
+  // Sync runtime from session on switch
+  const sessionRuntimeId = effectiveTargetSession?.runtimeId;
+  React.useEffect(() => {
+    if (sessionRuntimeId) {
+      setSelectedRuntimeId(sessionRuntimeId);
+    } else {
+      setSelectedRuntimeId(null);
+    }
+  }, [sessionRuntimeId]);
+
+  // Persist runtime selection to session store
+  const handleRuntimeChange = useCallback((runtimeId: string) => {
+    setSelectedRuntimeId(runtimeId);
+    if (effectiveTargetSessionId) {
+      const store = FlowChatStore.getInstance();
+      store.updateSessionRuntimeId(effectiveTargetSessionId, runtimeId);
+      const session = store.getState().sessions.get(effectiveTargetSessionId);
+      if (!session?.isTransient) {
+        agentAPI.updateSessionRuntime({
+          sessionId: effectiveTargetSessionId,
+          runtimeId,
+        }).catch((err) => {
+          console.warn('[ChatInput] failed to persist runtime:', err);
+        });
+      }
+    }
+  }, [effectiveTargetSessionId]);
   // isMultiLine: true when content overflows a single line (scrollHeight > threshold or has newlines)
   const [isMultiLine, setIsMultiLine] = useState(false);
   // showPlaceholder is true when the editor DOM is truly empty (value empty AND no residual <br>)
@@ -3177,6 +3210,11 @@ export const ChatInput: React.FC<ChatInputProps> = ({
                     sessionId={effectiveTargetSessionId || undefined}
                     currentTokens={tokenUsage.current}
                     maxTokens={tokenUsage.max}
+                  />
+                  <RuntimeSelector
+                    selectedRuntimeId={selectedRuntimeId}
+                    onRuntimeChange={handleRuntimeChange}
+                    disabled={hasDialogTurns}
                   />
                 </div>
 

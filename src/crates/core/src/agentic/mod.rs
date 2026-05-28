@@ -44,6 +44,7 @@ pub mod system;
 // Agents module
 pub mod agents;
 pub mod workspace;
+pub mod runtime_adapters;
 
 mod util;
 

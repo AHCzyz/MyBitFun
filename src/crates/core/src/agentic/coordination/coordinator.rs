@@ -1033,7 +1033,6 @@ Update the persona files and delete BOOTSTRAP.md as soon as bootstrap is complet
         );
         Ok(())
     }
-
     /// Create a new session
     pub async fn create_session(
         &self,
@@ -1118,6 +1117,19 @@ Update the persona files and delete BOOTSTRAP.md as soon as bootstrap is complet
         info!(
             "Coordinator updated session model: session_id={}, model_id={}",
             session_id, normalized_model_id
+        );
+
+        Ok(())
+    }
+
+    pub async fn update_session_runtime(&self, session_id: &str, runtime_id: &str) -> BitFunResult<()> {
+        self.session_manager
+            .update_session_runtime_id(session_id, runtime_id)
+            .await?;
+
+        info!(
+            "Coordinator updated session runtime: session_id={}, runtime_id={}",
+            session_id, runtime_id
         );
 
         Ok(())

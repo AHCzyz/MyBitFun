@@ -4,6 +4,8 @@
 //! This crate intentionally contains only DTOs and traits. It must not depend
 //! on concrete managers, platform adapters, `bitfun-core`, or app crates.
 
+pub mod agent_runtime;
+pub mod registry;
 use serde::{Deserialize, Serialize};
 
 pub type PortResult<T> = Result<T, PortError>;

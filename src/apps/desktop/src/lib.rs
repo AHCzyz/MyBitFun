@@ -692,6 +692,9 @@ pub async fn run() {
             get_runtime_logging_info,
             export_diagnostics_bundle,
             get_runtime_capabilities,
+            api::runtime_api::list_agent_runtimes,
+            api::runtime_api::get_default_agent_runtime,
+            api::agentic_api::update_session_runtime,
             get_agent_profile_configs,
             get_agent_profile_config,
             set_agent_profile_config,
@@ -1212,6 +1215,28 @@ async fn init_agentic_system() -> anyhow::Result<(
     cron_service.start();
 
     log::info!("Cron service initialized and subscriber registered");
+
+    // Register agent runtime adapters in the global registry
+    {
+        use bitfun_core::agentic::runtime_adapters::bitfun_runtime::BitfunRuntime;
+        use bitfun_core::agentic::runtime_adapters::omp_runtime::OmpRuntime;
+        use bitfun_core::agentic::runtime_adapters::claude_runtime::ClaudeRuntime;
+        use bitfun_core::agentic::system::AgenticSystem;
+        use bitfun_core::runtime_ports::registry::{init_global_runtime_registry, RuntimeRegistry};
+
+        let agentic_system = AgenticSystem {
+            coordinator: coordinator.clone(),
+            event_queue: event_queue.clone(),
+            token_usage_service: token_usage_service.clone(),
+        };
+        let mut registry = RuntimeRegistry::new();
+        registry.register(std::sync::Arc::new(BitfunRuntime::new(std::sync::Arc::new(agentic_system))));
+        registry.register(std::sync::Arc::new(OmpRuntime::new()));
+        registry.register(std::sync::Arc::new(ClaudeRuntime::new()));
+        init_global_runtime_registry(registry);
+        log::info!("Agent runtime registry initialized (BitFun, OMP, Claude)");
+    }
+
     log::info!("Agentic system initialized");
     Ok((
         coordinator,

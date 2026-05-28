@@ -1649,6 +1649,56 @@ impl SessionManager {
         Ok(())
     }
 
+    /// Update session runtime id (in-memory + persistence)
+    pub async fn update_session_runtime_id(
+        &self,
+        session_id: &str,
+        runtime_id: &str,
+    ) -> BitFunResult<()> {
+        // If the session was evicted from memory, try to restore it
+        if !self.sessions.contains_key(session_id) && self.config.enable_persistence {
+            let workspace_path = self
+                .session_workspace_index
+                .get(session_id)
+                .map(|entry| entry.clone());
+            if let Some(workspace_path) = workspace_path {
+                debug!(
+                    "Session evicted from memory, restoring for runtime update: session_id={}",
+                    session_id
+                );
+                let _ = self.restore_session(&workspace_path, session_id).await;
+            }
+        }
+
+        if let Some(mut session) = self.sessions.get_mut(session_id) {
+            session.config.runtime_id = Some(runtime_id.to_string());
+            session.updated_at = SystemTime::now();
+            session.last_activity_at = SystemTime::now();
+        } else {
+            return Err(BitFunError::NotFound(format!(
+                "Session not found: {}",
+                session_id
+            )));
+        }
+
+        if self.should_persist_session_id(session_id) {
+            let effective_path = self.effective_session_workspace_path(session_id).await;
+            let session_snapshot = self.sessions.get(session_id).map(|s| s.clone());
+            if let (Some(workspace_path), Some(session)) = (effective_path, session_snapshot) {
+                self.persistence_manager
+                    .save_session(&workspace_path, &session)
+                    .await?;
+            }
+        }
+
+        debug!(
+            "Session runtime id updated: session_id={}, runtime_id={}",
+            session_id, runtime_id
+        );
+
+        Ok(())
+    }
+
     /// Update session activity time
     pub fn touch_session(&self, session_id: &str) {
         if let Some(mut session) = self.sessions.get_mut(session_id) {

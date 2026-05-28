@@ -18,7 +18,9 @@
     ],
     "resources": {
       "../../mobile-web/dist": "mobile-web/dist",
-      "resources/worker_host.js": "resources/worker_host.js"
+      "resources/worker_host.js": "resources/worker_host.js",
+      "../../../resources/claude-bridge": "resources/claude-bridge",
+      "../../../resources/omp": "resources/omp"
     },
     "linux": {
       "deb": {

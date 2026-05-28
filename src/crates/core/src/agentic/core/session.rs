@@ -162,6 +162,9 @@ pub struct SessionConfig {
     /// Model config ID used by this session (for token usage tracking)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_id: Option<String>,
+    /// Runtime ID used by this session (for runtime-specific behavior)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_id: Option<String>,
 }
 
 impl Default for SessionConfig {
@@ -179,6 +182,7 @@ impl Default for SessionConfig {
             remote_connection_id: None,
             remote_ssh_host: None,
             model_id: None,
+            runtime_id: None,
         }
     }
 }
