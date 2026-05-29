@@ -1,11 +1,11 @@
 workflow: full
-phase: design
+phase: build
 build_mode: null
 isolation: null
 verify_mode: null
 base_ref: 8d8f22b57a4b98092c7044e6481a9996db52bcec
 design_doc: docs/superpowers/specs/2026-05-30-runtime-turn-persistence-design.md
-plan: null
+plan: docs/superpowers/plans/2026-05-30-runtime-turn-persistence.md
 verify_result: pending
 verification_report: null
 branch_status: pending
