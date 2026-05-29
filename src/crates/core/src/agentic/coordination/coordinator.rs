@@ -41,8 +41,11 @@ use crate::service::workspace::{
     get_global_workspace_service, WorkspaceCreateOptions, WorkspaceKind,
 };
 use crate::util::errors::{BitFunError, BitFunResult};
-use bitfun_runtime_ports::{DelegationPolicy, SubagentContextMode};
-use bitfun_runtime_ports::agent_runtime::{AgentEvent as RuntimeEvent, AgentRuntime, AgentSession, SessionConfig as RuntimeSessionConfig};
+use bitfun_core_types::errors::{
+    ai_error_detail_from_message, classify_ai_error_message, ErrorCategory,
+};
+use bitfun_runtime_ports::{DelegationPolicy, PortErrorKind, SubagentContextMode};
+use bitfun_runtime_ports::agent_runtime::{AgentEvent as RuntimeEvent, AgentSession, SessionConfig as RuntimeSessionConfig};
 use bitfun_runtime_ports::registry::get_global_runtime_registry;
 use dashmap::DashMap;
 use log::{debug, error, info, warn};
@@ -54,6 +57,31 @@ use std::sync::OnceLock;
 use tokio::sync::{mpsc, watch, OwnedSemaphorePermit, RwLock, Semaphore};
 use tokio::time::{sleep, Duration, Instant};
 use tokio_util::sync::CancellationToken;
+
+/// Map a runtime-path error to an `ErrorCategory` for `DialogTurnFailed`.
+///
+/// Strategy: try message-string heuristics first (catches provider-embedded
+/// signals like rate-limit / quota that arrive in the message body of a
+/// `PortErrorKind::Backend`). Fall back to a structural mapping of the
+/// `PortErrorKind` variant. If neither yields a useful category, return
+/// `ModelError` — runtime errors that reach this point are, definitionally,
+/// model-side. See `docs/superpowers/specs/...` design doc D1.
+fn classify_runtime_error(message: &str, kind: Option<&PortErrorKind>) -> ErrorCategory {
+    let from_message = classify_ai_error_message(message);
+    if !matches!(from_message, ErrorCategory::Unknown) {
+        return from_message;
+    }
+    match kind {
+        Some(PortErrorKind::Timeout) => ErrorCategory::Timeout,
+        Some(PortErrorKind::PermissionDenied) => ErrorCategory::Auth,
+        Some(PortErrorKind::NotAvailable) => ErrorCategory::ProviderUnavailable,
+        Some(PortErrorKind::InvalidRequest) | Some(PortErrorKind::NotFound) => {
+            ErrorCategory::InvalidRequest
+        }
+        Some(PortErrorKind::Cancelled) => ErrorCategory::Unknown,
+        Some(PortErrorKind::Backend) | None => ErrorCategory::ModelError,
+    }
+}
 
 const MANUAL_COMPACTION_COMMAND: &str = "/compact";
 const CONTEXT_COMPRESSION_TOOL_NAME: &str = "ContextCompression";
@@ -2635,13 +2663,16 @@ Update the persona files and delete BOOTSTRAP.md as soon as bootstrap is complet
                 let mut stream = match rt_session.prompt(&wrapped_user_input, vec![]).await {
                     Ok(s) => s,
                     Err(e) => {
+                        let err_msg = e.to_string();
+                        let category = classify_runtime_error(&err_msg, Some(&e.kind));
+                        let detail = ai_error_detail_from_message(&err_msg, category.clone());
                         let _ = event_queue.enqueue(
                             AgenticEvent::DialogTurnFailed {
                                 session_id: session_id_clone.clone(),
                                 turn_id: turn_id_clone.clone(),
-                                error: e.to_string(),
-                                error_category: None,
-                                error_detail: None,
+                                error: err_msg,
+                                error_category: Some(category),
+                                error_detail: Some(detail),
                             },
                             Some(EventPriority::High),
                         ).await;
@@ -2729,13 +2760,16 @@ Update the persona files and delete BOOTSTRAP.md as soon as bootstrap is complet
                                     "aborted"
                                 }
                                 _ => {
+                                    let err_msg = format!("Runtime turn ended: {:?}", stop_reason);
+                                    let category = classify_runtime_error(&err_msg, None);
+                                    let detail = ai_error_detail_from_message(&err_msg, category.clone());
                                     let _ = event_queue.enqueue(
                                         AgenticEvent::DialogTurnFailed {
                                             session_id: session_id_clone.clone(),
                                             turn_id: turn_id_clone.clone(),
-                                            error: format!("Runtime turn ended: {:?}", stop_reason),
-                                            error_category: None,
-                                            error_detail: None,
+                                            error: err_msg,
+                                            error_category: Some(category),
+                                            error_detail: Some(detail),
                                         },
                                         Some(EventPriority::High),
                                     ).await;
@@ -2749,13 +2783,15 @@ Update the persona files and delete BOOTSTRAP.md as soon as bootstrap is complet
                             break;
                         }
                         RuntimeEvent::Error { message, .. } => {
+                            let category = classify_runtime_error(&message, None);
+                            let detail = ai_error_detail_from_message(&message, category.clone());
                             let _ = event_queue.enqueue(
                                 AgenticEvent::DialogTurnFailed {
                                     session_id: session_id_clone.clone(),
                                     turn_id: turn_id_clone.clone(),
                                     error: message,
-                                    error_category: None,
-                                    error_detail: None,
+                                    error_category: Some(category),
+                                    error_detail: Some(detail),
                                 },
                                 Some(EventPriority::High),
                             ).await;
