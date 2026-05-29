@@ -9,6 +9,7 @@ import { basename, dirname, join, relative, sep } from 'path';
 import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'fs';
 import { ensureOpenSslWindows } from './ensure-openssl-windows.mjs';
 import { ensureFlashgrepBinary } from './prepare-flashgrep-resource.mjs';
+import { prepareRuntimeResources } from './prepare-runtime-resources.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(__dirname, '..');
@@ -35,6 +36,8 @@ async function main() {
   await ensureOpenSslWindows();
   const flashgrepBinary = ensureFlashgrepBinary();
   process.env.FLASHGREP_DAEMON_BIN = flashgrepBinary;
+
+  await prepareRuntimeResources();
 
   const desktopDir = join(ROOT, 'src', 'apps', 'desktop');
   // Tauri CLI reads CI and rejects numeric "1" (common in CI providers).

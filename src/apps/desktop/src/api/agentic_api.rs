@@ -63,6 +63,8 @@ pub struct SessionConfigDTO {
     pub remote_connection_id: Option<String>,
     #[serde(default)]
     pub remote_ssh_host: Option<String>,
+    #[serde(default)]
+    pub runtime_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -599,7 +601,7 @@ pub async fn create_session(
             remote_connection_id: remote_conn.clone(),
             remote_ssh_host: remote_ssh_host.clone(),
             model_id: c.model_name,
-            runtime_id: None,
+            runtime_id: c.runtime_id,
         })
         .unwrap_or(SessionConfig {
             workspace_path: Some(request.workspace_path.clone()),

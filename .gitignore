@@ -72,4 +72,8 @@ tests/e2e/reports/
 ASSETS_LICENSES.md
 
 external/
-resources/omp/*.exe
+resources/omp/omp
+resources/omp/omp.exe
+resources/omp/.omp-version
+resources/claude-bridge/node
+resources/claude-bridge/node.exe

@@ -42,6 +42,8 @@ use crate::service::workspace::{
 };
 use crate::util::errors::{BitFunError, BitFunResult};
 use bitfun_runtime_ports::{DelegationPolicy, SubagentContextMode};
+use bitfun_runtime_ports::agent_runtime::{AgentEvent as RuntimeEvent, AgentRuntime, AgentSession, SessionConfig as RuntimeSessionConfig};
+use bitfun_runtime_ports::registry::get_global_runtime_registry;
 use dashmap::DashMap;
 use log::{debug, error, info, warn};
 use std::collections::{HashMap, HashSet};
@@ -477,6 +479,11 @@ pub struct ConversationCoordinator {
     /// Map value is a counter shared between the coordinator and the spawn
     /// task; spawn task increments on entry and decrements on exit.
     active_turns_per_session: Arc<DashMap<String, Arc<AtomicUsize>>>,
+    /// Cached AgentSession instances for external runtimes (OMP, Claude).
+    /// Keyed by BitFun session_id. The Mutex guards concurrent access;
+    /// the inner Option is None while a turn is in-flight (taken out),
+    /// Some when idle and ready for reuse.
+    runtime_sessions: Arc<DashMap<String, Arc<tokio::sync::Mutex<Option<Box<dyn AgentSession>>>>>>,
 }
 
 impl ConversationCoordinator {
@@ -991,6 +998,7 @@ Update the persona files and delete BOOTSTRAP.md as soon as bootstrap is complet
             round_preempt_source: OnceLock::new(),
             round_injection_source: OnceLock::new(),
             active_turns_per_session: Arc::new(DashMap::new()),
+            runtime_sessions: Arc::new(DashMap::new()),
         }
     }
 
@@ -2554,7 +2562,216 @@ Update the persona files and delete BOOTSTRAP.md as soon as bootstrap is complet
 
         // Start new dialog turn (sets state to Processing internally)
         let turn_index = self.session_manager.get_turn_count(&session_id);
-        // Pass frontend turnId, generate if not provided
+
+        // Resolve runtime: if non-bitfun, dispatch through the AgentRuntime adapter.
+        let effective_runtime_id = session.config.runtime_id.clone()
+            .filter(|id| id != "bitfun");
+
+        if let Some(ref runtime_id) = effective_runtime_id {
+            let turn_id = self
+                .session_manager
+                .start_dialog_turn(
+                    &session_id,
+                    effective_agent_type.clone(),
+                    wrapped_user_input.clone(),
+                    turn_id,
+                    image_contexts,
+                    user_message_metadata.clone(),
+                )
+                .await?;
+
+            self.emit_event(AgenticEvent::DialogTurnStarted {
+                session_id: session_id.clone(),
+                turn_id: turn_id.clone(),
+                turn_index,
+                user_input: wrapped_user_input.clone(),
+                original_user_input: if original_user_input != wrapped_user_input {
+                    Some(original_user_input.clone())
+                } else {
+                    None
+                },
+                user_message_metadata: user_message_metadata.clone(),
+            })
+            .await;
+
+            let registry = get_global_runtime_registry();
+            let runtime = registry.get(runtime_id).cloned().ok_or_else(|| {
+                BitFunError::Validation(format!("Unknown runtime: {}", runtime_id))
+            })?;
+
+            // Try to reuse a cached AgentSession for this session.
+            let session_slot = self
+                .runtime_sessions
+                .entry(session_id.clone())
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(None)));
+            let rt_session = {
+                let mut guard = session_slot.lock().await;
+                if let Some(existing) = guard.take() {
+                    existing
+                } else {
+                    runtime.create_session(RuntimeSessionConfig {
+                        model_id: session.config.model_id.clone(),
+                        working_dir: session.config.workspace_path.clone(),
+                        runtime_options: Default::default(),
+                    }).await.map_err(|e| BitFunError::Validation(e.to_string()))?
+                }
+            };
+
+            let active_counter = self
+                .active_turns_per_session
+                .entry(session_id.clone())
+                .or_insert_with(|| Arc::new(AtomicUsize::new(0)))
+                .clone();
+            active_counter.fetch_add(1, Ordering::SeqCst);
+
+            let event_queue = self.event_queue.clone();
+            let session_manager = self.session_manager.clone();
+            let session_id_clone = session_id.clone();
+            let turn_id_clone = turn_id.clone();
+            let runtime_id_for_log = runtime_id.clone();
+            let session_slot_clone = session_slot.clone();
+
+            tokio::spawn(async move {
+                let mut stream = match rt_session.prompt(&wrapped_user_input, vec![]).await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        let _ = event_queue.enqueue(
+                            AgenticEvent::DialogTurnFailed {
+                                session_id: session_id_clone.clone(),
+                                turn_id: turn_id_clone.clone(),
+                                error: e.to_string(),
+                            },
+                            Some(EventPriority::High),
+                        ).await;
+                        // Session may be in a bad state, dispose instead of caching.
+                        let _ = rt_session.dispose().await;
+                        return;
+                    }
+                };
+
+                use futures::StreamExt;
+                while let Some(event) = stream.next().await {
+                    match event {
+                        RuntimeEvent::TextDelta { delta, .. } => {
+                            let _ = event_queue.enqueue(
+                                AgenticEvent::TextChunk {
+                                    session_id: session_id_clone.clone(),
+                                    turn_id: turn_id_clone.clone(),
+                                    round_id: turn_id_clone.clone(),
+                                    text: delta,
+                                },
+                                Some(EventPriority::Normal),
+                            ).await;
+                        }
+                        RuntimeEvent::ThinkingDelta { delta, .. } => {
+                            let _ = event_queue.enqueue(
+                                AgenticEvent::ThinkingChunk {
+                                    session_id: session_id_clone.clone(),
+                                    turn_id: turn_id_clone.clone(),
+                                    round_id: turn_id_clone.clone(),
+                                    content: delta,
+                                    is_end: false,
+                                },
+                                Some(EventPriority::Normal),
+                            ).await;
+                        }
+                        RuntimeEvent::ToolCallStart { tool_name, tool_call_id, .. } => {
+                            let _ = event_queue.enqueue(
+                                AgenticEvent::ToolEvent {
+                                    session_id: session_id_clone.clone(),
+                                    turn_id: turn_id_clone.clone(),
+                                    round_id: turn_id_clone.clone(),
+                                    tool_event: bitfun_events::agentic::ToolEventData::Started {
+                                        tool_id: tool_call_id,
+                                        tool_name,
+                                        params: serde_json::Value::Null,
+                                        timeout_seconds: None,
+                                    },
+                                },
+                                Some(EventPriority::Normal),
+                            ).await;
+                        }
+                        RuntimeEvent::TurnEnd { stop_reason, .. } => {
+                            let outcome = match stop_reason {
+                                bitfun_runtime_ports::agent_runtime::StopReason::Completed => {
+                                    let _ = event_queue.enqueue(
+                                        AgenticEvent::DialogTurnCompleted {
+                                            session_id: session_id_clone.clone(),
+                                            turn_id: turn_id_clone.clone(),
+                                            total_rounds: 1,
+                                            total_tools: 0,
+                                            duration_ms: 0,
+                                            partial_recovery_reason: None,
+                                            success: Some(true),
+                                            finish_reason: None,
+                                        },
+                                        Some(EventPriority::High),
+                                    ).await;
+                                    "completed"
+                                }
+                                bitfun_runtime_ports::agent_runtime::StopReason::Aborted => {
+                                    let _ = event_queue.enqueue(
+                                        AgenticEvent::DialogTurnCancelled {
+                                            session_id: session_id_clone.clone(),
+                                            turn_id: turn_id_clone.clone(),
+                                        },
+                                        Some(EventPriority::High),
+                                    ).await;
+                                    "aborted"
+                                }
+                                _ => {
+                                    let _ = event_queue.enqueue(
+                                        AgenticEvent::DialogTurnFailed {
+                                            session_id: session_id_clone.clone(),
+                                            turn_id: turn_id_clone.clone(),
+                                            error: format!("Runtime turn ended: {:?}", stop_reason),
+                                            error_category: None,
+                                            error_detail: None,
+                                        },
+                                        Some(EventPriority::High),
+                                    ).await;
+                                    "error"
+                                }
+                            };
+                            log::info!(
+                                "Runtime {} turn ended: session_id={}, turn_id={}, outcome={}",
+                                runtime_id_for_log, session_id_clone, turn_id_clone, outcome
+                            );
+                            break;
+                        }
+                        RuntimeEvent::Error { message, .. } => {
+                            let _ = event_queue.enqueue(
+                                AgenticEvent::DialogTurnFailed {
+                                    session_id: session_id_clone.clone(),
+                                    turn_id: turn_id_clone.clone(),
+                                    error: message,
+                                    error_category: None,
+                                    error_detail: None,
+                                },
+                                Some(EventPriority::High),
+                            ).await;
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+
+                // Return the session to cache for reuse by the next turn.
+                let mut slot_guard = session_slot_clone.lock().await;
+                *slot_guard = Some(rt_session);
+                drop(slot_guard);
+
+                active_counter.fetch_sub(1, Ordering::SeqCst);
+                session_manager.reset_session_state_if_processing(
+                    &session_id_clone,
+                    &turn_id_clone,
+                );
+            });
+
+            return Ok(());
+        }
+
+        // Default (bitfun) path — existing ExecutionEngine execution
         let turn_id = self
             .session_manager
             .start_dialog_turn(

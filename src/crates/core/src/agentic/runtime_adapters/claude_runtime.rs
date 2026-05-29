@@ -30,12 +30,7 @@ impl ClaudeRuntime {
     }
 
     /// Resolve the path to `bridge.mjs` at runtime.
-    ///
-    /// Tries several locations in order:
-    /// 1. Relative to the workspace root (development)
-    /// 2. Relative to the current executable (bundled)
     fn bridge_path() -> PathBuf {
-        // Development: resolve from CARGO_MANIFEST_DIR
         let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let workspace_root = manifest_dir.join("../../..");
         let dev_path = workspace_root.join("resources/claude-bridge/bridge.mjs");
@@ -43,14 +38,12 @@ impl ClaudeRuntime {
             return dev_path;
         }
 
-        // Bundled: relative to the current executable
         if let Ok(exe) = std::env::current_exe() {
             if let Some(parent) = exe.parent() {
                 let bundled = parent.join("resources/claude-bridge/bridge.mjs");
                 if bundled.exists() {
                     return bundled;
                 }
-                // macOS .app bundle
                 let macos = parent.join("../Resources/claude-bridge/bridge.mjs");
                 if macos.exists() {
                     return macos;
@@ -58,8 +51,28 @@ impl ClaudeRuntime {
             }
         }
 
-        // Fallback: return the dev path anyway (will fail later with a clear error)
         dev_path
+    }
+
+    /// Resolve the Node.js binary path.
+    /// Order: bundled (next to bridge.mjs) → system PATH.
+    fn resolve_node_binary() -> Option<PathBuf> {
+        let bridge = Self::bridge_path();
+        if let Some(bridge_dir) = bridge.parent() {
+            let bundled = bridge_dir.join("node");
+            if bundled.exists() {
+                return Some(bundled);
+            }
+            #[cfg(windows)]
+            {
+                let bundled_exe = bridge_dir.join("node.exe");
+                if bundled_exe.exists() {
+                    return Some(bundled_exe);
+                }
+            }
+        }
+
+        which::which("node").ok()
     }
 }
 
@@ -99,14 +112,12 @@ impl AgentRuntime for ClaudeRuntime {
                 ),
             ));
         }
-        // Pre-flight: verify Node.js is available
-        if which::which("node").is_err() {
-            return Err(PortError::new(
+        let node_binary = Self::resolve_node_binary().ok_or_else(|| {
+            PortError::new(
                 PortErrorKind::NotAvailable,
-                "Node.js is not installed. Install Node.js to use the Claude Agent SDK runtime.".to_string(),
-            ));
-        }
-        // Pre-flight: verify ANTHROPIC_API_KEY
+                "Node.js not found: not bundled and not in PATH".to_string(),
+            )
+        })?;
         if std::env::var("ANTHROPIC_API_KEY").is_err() {
             return Err(PortError::new(
                 PortErrorKind::PermissionDenied,
@@ -114,14 +125,13 @@ impl AgentRuntime for ClaudeRuntime {
             ));
         }
 
-        // Determine the working directory
         let working_dir = config
             .working_dir
             .as_deref()
             .unwrap_or(".")
             .to_string();
 
-        let mut child = Command::new("node")
+        let mut child = Command::new(&node_binary)
             .arg(bridge.to_str().ok_or_else(|| {
                 PortError::new(
                     PortErrorKind::Backend,
@@ -206,9 +216,6 @@ impl AgentRuntime for ClaudeRuntime {
     }
 
     async fn health_check(&self) -> PortResult<()> {
-        // Only verify the bridge script exists — it is bundled with the app.
-        // Node.js availability and ANTHROPIC_API_KEY are checked at session
-        // creation time so the runtime always shows as "available" in the UI.
         let bridge = Self::bridge_path();
         if !bridge.exists() {
             return Err(PortError::new(
@@ -217,6 +224,23 @@ impl AgentRuntime for ClaudeRuntime {
                     "Claude bridge script not found at {}",
                     bridge.display()
                 ),
+            ));
+        }
+        match Self::resolve_node_binary() {
+            Some(path) => {
+                log::info!("[ClaudeRuntime] found node at: {}", path.display());
+            }
+            None => {
+                return Err(PortError::new(
+                    PortErrorKind::NotAvailable,
+                    "Node.js not found: not bundled and not in PATH".to_string(),
+                ));
+            }
+        }
+        if std::env::var("ANTHROPIC_API_KEY").is_err() {
+            return Err(PortError::new(
+                PortErrorKind::PermissionDenied,
+                "ANTHROPIC_API_KEY environment variable not set.".to_string(),
             ));
         }
         Ok(())

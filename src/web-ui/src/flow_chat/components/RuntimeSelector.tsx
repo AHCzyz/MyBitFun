@@ -116,7 +116,7 @@ export const RuntimeSelector: React.FC<RuntimeSelectorProps> = ({
   const handleSelect = useCallback(
     (runtimeId: string) => {
       const rt = runtimes.find((r) => r.id === runtimeId);
-      if (rt) {
+      if (rt && rt.available) {
         onRuntimeChange(runtimeId);
         setDropdownOpen(false);
       }
@@ -153,6 +153,7 @@ export const RuntimeSelector: React.FC<RuntimeSelectorProps> = ({
                   key={rt.id}
                   className={`bitfun-runtime-selector__option${isSelected ? ' bitfun-runtime-selector__option--selected' : ''}${!rt.available ? ' bitfun-runtime-selector__option--unavailable' : ''}`}
                   onClick={() => handleSelect(rt.id)}
+                  disabled={!rt.available}
                   title={rt.error || rt.description}
                   type="button"
                 >

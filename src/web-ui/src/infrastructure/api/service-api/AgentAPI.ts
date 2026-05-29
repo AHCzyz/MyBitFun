@@ -172,6 +172,12 @@ export interface ModeInfo {
    * share the same key can reuse the same session-level prompt cache.
    */
   promptCacheScopeKey: string;
+  /** Config profile ID for grouping modes that share tool/skill settings. */
+  configProfileId?: string;
+  /** Display label for the config profile group. */
+  configProfileLabel?: string;
+  /** Mode IDs that belong to the same config profile group. */
+  configProfileMemberModeIds?: string[];
 }
 
 
