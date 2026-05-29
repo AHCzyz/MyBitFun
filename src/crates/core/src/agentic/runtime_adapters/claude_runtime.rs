@@ -142,6 +142,11 @@ impl AgentRuntime for ClaudeRuntime {
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::inherit())
+            // Safety net: ensure the bridge child is killed if the
+            // ClaudeSession Box is dropped without dispose() (e.g. concurrent
+            // turn displacement, panic, abort cancellation). dispose() still
+            // kills explicitly; this is idempotent on top of that.
+            .kill_on_drop(true)
             .spawn()
             .map_err(|e| {
                 PortError::new(
