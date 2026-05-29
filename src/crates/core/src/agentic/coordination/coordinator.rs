@@ -181,7 +181,9 @@ async fn run_runtime_event_loop(
     session_id: String,
     turn_id: String,
     runtime_id_for_log: String,
+    session_manager: Arc<SessionManager>,
 ) {
+    let _ = &session_manager; // used in Task 4 (persist calls)
     let _cancel_guard = RuntimeCancelGuard::armed(runtime_turn_cancels, turn_id.clone());
 
     // D8 / F-2: a cancel may have fired during the cold-start
@@ -3029,6 +3031,7 @@ Update the persona files and delete BOOTSTRAP.md as soon as bootstrap is complet
 
             let event_queue = self.event_queue.clone();
             let session_manager = self.session_manager.clone();
+            let session_manager_for_loop = session_manager.clone();
             let session_id_clone = session_id.clone();
             let turn_id_clone = turn_id.clone();
             let runtime_id_for_log = runtime_id.clone();
@@ -3057,6 +3060,7 @@ Update the persona files and delete BOOTSTRAP.md as soon as bootstrap is complet
                     session_id_clone,
                     turn_id_clone,
                     runtime_id_for_log,
+                    session_manager_for_loop,
                 ).await;
             });
 
@@ -6051,6 +6055,51 @@ mod tests {
         })
     }
 
+    // runtime-turn-persistence (F-3): minimal SessionManager over a temp
+    // workspace, so run_runtime_event_loop's persist calls have a real target.
+    // Mirrors session_manager.rs TestWorkspace (std::env::temp_dir +
+    // PathManager::with_user_root_for_tests), NOT tempfile.
+    struct TestWs {
+        path: std::path::PathBuf,
+    }
+    impl TestWs {
+        fn new() -> Self {
+            let path = std::env::temp_dir()
+                .join(format!("bitfun-rt-persist-test-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&path).expect("test workspace");
+            Self { path }
+        }
+        fn path_manager(&self) -> Arc<crate::infrastructure::PathManager> {
+            Arc::new(crate::infrastructure::PathManager::with_user_root_for_tests(
+                self.path.join("user-root"),
+            ))
+        }
+    }
+    impl Drop for TestWs {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn test_session_manager() -> Arc<crate::agentic::session::SessionManager> {
+        let ws = TestWs::new();
+        let pm = Arc::new(
+            crate::agentic::persistence::PersistenceManager::new(ws.path_manager())
+                .expect("persistence"),
+        );
+        Arc::new(crate::agentic::session::SessionManager::new(
+            Arc::new(crate::agentic::session::SessionContextStore::new()),
+            pm,
+            crate::agentic::session::SessionManagerConfig {
+                max_active_sessions: 100,
+                session_idle_timeout: std::time::Duration::from_secs(3600),
+                auto_save_interval: std::time::Duration::from_secs(300),
+                enable_persistence: true,
+                prompt_cache_policy: crate::agentic::session::PromptCachePolicy::default(),
+            },
+        ))
+    }
+
     #[tokio::test]
     async fn runtime_event_loop_cancels_promptly() {
         // F-6: keep tx alive so stream.next() stays pending; otherwise
@@ -6071,7 +6120,7 @@ mod tests {
         let task = tokio::spawn(run_runtime_event_loop(
             session, "hi".into(), cancel.clone(), cancels.clone(),
             queue.clone(), slot.clone(),
-            "sid".into(), "tid".into(), "claude".into(),
+            "sid".into(), "tid".into(), "claude".into(), test_session_manager(),
         ));
 
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -6115,7 +6164,7 @@ mod tests {
         run_runtime_event_loop(
             session, "hi".into(), cancel, cancels.clone(),
             queue.clone(), slot.clone(),
-            "sid".into(), "tid".into(), "claude".into(),
+            "sid".into(), "tid".into(), "claude".into(), test_session_manager(),
         ).await;
 
         assert!(!disposed.load(Ordering::SeqCst), "happy path disposed (should not)");
@@ -6152,7 +6201,7 @@ mod tests {
         run_runtime_event_loop(
             session, "hi".into(), cancel, cancels.clone(),
             queue.clone(), slot.clone(),
-            "sid".into(), "tid".into(), "claude".into(),
+            "sid".into(), "tid".into(), "claude".into(), test_session_manager(),
         ).await;
 
         assert!(disposed.load(Ordering::SeqCst),
@@ -6187,7 +6236,7 @@ mod tests {
         run_runtime_event_loop(
             session, "hi".into(), cancel, cancels.clone(),
             queue.clone(), slot.clone(),
-            "sid".into(), "tid".into(), "claude".into(),
+            "sid".into(), "tid".into(), "claude".into(), test_session_manager(),
         ).await;
 
         assert!(!prompt_called.load(Ordering::SeqCst),
@@ -6232,7 +6281,7 @@ mod tests {
         run_runtime_event_loop(
             session, "hi".into(), cancel, cancels.clone(),
             queue.clone(), slot.clone(),
-            "sid".into(), "tid".into(), "claude".into(),
+            "sid".into(), "tid".into(), "claude".into(), test_session_manager(),
         ).await;
 
         assert!(prompt_called.load(Ordering::SeqCst), "prompt() was not reached");
@@ -6275,7 +6324,7 @@ mod tests {
         run_runtime_event_loop(
             session, "hi".into(), cancel, cancels.clone(),
             queue.clone(), slot.clone(),
-            "sid".into(), "tid".into(), "claude".into(),
+            "sid".into(), "tid".into(), "claude".into(), test_session_manager(),
         ).await;
 
         assert!(prompt_called.load(Ordering::SeqCst), "prompt() was not reached");
@@ -6337,7 +6386,7 @@ mod tests {
         run_runtime_event_loop(
             session, "hi".into(), cancel, cancels.clone(),
             queue.clone(), slot.clone(),
-            "sid".into(), "tid".into(), "claude".into(),
+            "sid".into(), "tid".into(), "claude".into(), test_session_manager(),
         ).await;
 
         assert!(prompt_called.load(Ordering::SeqCst), "prompt() was not reached");
