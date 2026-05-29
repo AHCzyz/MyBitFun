@@ -206,6 +206,23 @@ async fn run_runtime_event_loop(
     let mut stream = match rt_session.prompt(&user_input, vec![]).await {
         Ok(s) => s,
         Err(e) => {
+            // review4 B: cancel may have fired between D8 is_cancelled() check and prompt() Err.
+            // Recheck to classify as Cancelled rather than Failed.
+            if cancel_token.is_cancelled() {
+                log::info!(
+                    "Runtime {} turn cancelled during prompt(): session_id={}, turn_id={}",
+                    runtime_id_for_log, session_id, turn_id,
+                );
+                let _ = event_queue.enqueue(
+                    AgenticEvent::DialogTurnCancelled {
+                        session_id: session_id.clone(),
+                        turn_id: turn_id.clone(),
+                    },
+                    Some(EventPriority::High),
+                ).await;
+                let _ = rt_session.dispose().await;
+                return;
+            }
             let err_msg = e.to_string();
             let category = classify_runtime_error(&err_msg, Some(&e.kind));
             let detail = ai_error_detail_from_message(&err_msg, category.clone());
@@ -5887,6 +5904,30 @@ mod tests {
     use std::collections::HashMap;
     use tokio::sync::mpsc;
     use tokio_util::sync::CancellationToken;
+    // -------- RuntimeCancelGuard unit tests (review4 A) --------
+    use super::RuntimeCancelGuard;
+
+    #[test]
+    fn runtime_cancel_guard_removes_when_armed() {
+        let m: Arc<DashMap<String, CancellationToken>> = Arc::new(DashMap::new());
+        m.insert("t".into(), CancellationToken::new());
+        {
+            let _g = RuntimeCancelGuard::armed(m.clone(), "t".into());
+        }
+        assert!(m.get("t").is_none(), "armed guard must remove entry on drop");
+    }
+
+    #[test]
+    fn runtime_cancel_guard_keeps_when_disarmed() {
+        let m: Arc<DashMap<String, CancellationToken>> = Arc::new(DashMap::new());
+        m.insert("t".into(), CancellationToken::new());
+        {
+            let mut g = RuntimeCancelGuard::armed(m.clone(), "t".into());
+            g.disarm();
+        }
+        assert!(m.get("t").is_some(), "disarmed guard must NOT remove (ownership transferred)");
+    }
+
 
     struct FakeSession {
         session_id: String,
@@ -5935,6 +5976,7 @@ mod tests {
 
         let cancel = CancellationToken::new();
         let cancels: Arc<DashMap<String, CancellationToken>> = Arc::new(DashMap::new());
+        cancels.insert("tid".into(), cancel.clone()); // review4 A: pre-populate to verify guard removal
         let queue = Arc::new(EventQueue::new(EventQueueConfig::default()));
         let slot: Arc<tokio::sync::Mutex<Option<Box<dyn AgentSession>>>> =
             Arc::new(tokio::sync::Mutex::new(None));
@@ -5960,6 +6002,7 @@ mod tests {
             batch.iter().any(|env| matches!(env.event, AgenticEvent::DialogTurnCancelled { .. })),
             "DialogTurnCancelled was not emitted"
         );
+        assert!(cancels.get("tid").is_none(), "cancel guard did not remove entry after cancel path");
     }
 
     #[tokio::test]
@@ -6045,12 +6088,13 @@ mod tests {
         let cancel = CancellationToken::new();
         cancel.cancel();  // BEFORE running helper
         let cancels: Arc<DashMap<String, CancellationToken>> = Arc::new(DashMap::new());
+        cancels.insert("tid".into(), cancel.clone()); // review4 A: pre-populate to verify guard removal
         let queue = Arc::new(EventQueue::new(EventQueueConfig::default()));
         let slot: Arc<tokio::sync::Mutex<Option<Box<dyn AgentSession>>>> =
             Arc::new(tokio::sync::Mutex::new(None));
 
         run_runtime_event_loop(
-            session, "hi".into(), cancel, cancels,
+            session, "hi".into(), cancel, cancels.clone(),
             queue.clone(), slot.clone(),
             "sid".into(), "tid".into(), "claude".into(),
         ).await;
@@ -6065,6 +6109,7 @@ mod tests {
             batch.iter().any(|env| matches!(env.event, AgenticEvent::DialogTurnCancelled { .. })),
             "DialogTurnCancelled was not emitted"
         );
+        assert!(cancels.get("tid").is_none(), "cancel guard did not remove entry after pre-cancel path");
     }
 
 }
