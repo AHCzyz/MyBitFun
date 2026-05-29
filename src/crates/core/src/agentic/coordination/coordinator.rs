@@ -3407,12 +3407,55 @@ Update the persona files and delete BOOTSTRAP.md as soon as bootstrap is complet
         Ok(Some(current_turn_id))
     }
 
-    /// Delete session
+    /// Canonical entry point for deleting a *live* session. Tears down
+    /// every coordinator-owned and session-manager-owned piece of
+    /// per-session state in a defined order: cancel in-flight turn →
+    /// dispose cached runtime session → drop the active-turn counter →
+    /// hand off to `session_manager` for its own stores + persistence.
+    ///
+    /// Future deletion paths MUST go through this function. Direct
+    /// calls to `session_manager.delete_session` are acceptable only
+    /// when the session is known not to be loaded in memory — i.e.
+    /// there is no `runtime_sessions` or `active_turns_per_session`
+    /// entry for it (e.g. the persistence-only purge in
+    /// `session_api.rs`). Anything that touches a live session must
+    /// route here so runtime sessions don't accumulate on the heap
+    /// and bridge child processes don't pile up.
     pub async fn delete_session(
         &self,
         workspace_path: &Path,
         session_id: &str,
     ) -> BitFunResult<()> {
+        // 1. Cancel any in-flight turn so the runtime session quiesces
+        //    before we tear it down. Best-effort — failure here falls
+        //    through to forced cleanup below; matches the cascade
+        //    path's discipline at delete_hidden_subagent_sessions_…
+        if let Err(e) = self
+            .cancel_active_turn_for_session(session_id, Duration::from_secs(2))
+            .await
+        {
+            warn!(
+                "Failed to cancel active turn before session deletion: session_id={}, error={}",
+                session_id, e
+            );
+        }
+
+        // 2. Tear down the cached runtime session if any. dispose()
+        //    cancels the abort_token + kills the bridge child cleanly;
+        //    kill_on_drop is the safety net for any path that bypasses
+        //    dispose. Removing the DashMap entry here is what closes
+        //    review1 P4 — entries used to leak for the process lifetime.
+        if let Some((_, slot)) = self.runtime_sessions.remove(session_id) {
+            if let Some(session) = slot.lock().await.take() {
+                let _ = session.dispose().await;
+            }
+        }
+
+        // 3. Drop the active-turn counter for this session.
+        self.active_turns_per_session.remove(session_id);
+
+        // 4. Hand off to session_manager for its own stores +
+        //    persistence + downstream services.
         self.session_manager
             .delete_session(workspace_path, session_id)
             .await?;
