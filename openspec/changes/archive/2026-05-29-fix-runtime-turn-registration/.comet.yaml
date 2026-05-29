@@ -1,0 +1,13 @@
+workflow: hotfix
+phase: archive
+build_mode: direct
+isolation: branch
+verify_mode: light
+design_doc: null
+plan: null
+verify_result: pass
+verification_report: docs/superpowers/reports/2026-05-29-fix-runtime-turn-registration-verify.md
+branch_status: handled
+verified_at: 2026-05-29
+archived: true
+build_command: cd MyBitFun && cargo check -p bitfun-core --message-format=short

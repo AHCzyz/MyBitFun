@@ -1,0 +1,17 @@
+workflow: full
+phase: archive
+build_mode: subagent-driven-development
+isolation: branch
+verify_mode: full
+base_ref: 95c40184b8f731f2ad54ef28a4d07fe0975abf12
+design_doc: docs/superpowers/specs/2026-05-28-multi-runtime-design.md
+plan: docs/superpowers/plans/2026-05-28-multi-runtime.md
+verify_result: pass
+verification_report: docs/superpowers/reports/2026-05-28-multi-runtime-support-verify.md
+branch_status: handled
+created_at: 2026-05-28
+verified_at: 2026-05-29
+archived: true
+build_command: cd MyBitFun-main/MyBitFun-main && cargo check -p bitfun-core -p bitfun-desktop
+handoff_context: openspec/changes/multi-runtime-support/.comet/handoff/design-context.json
+handoff_hash: 7b23cb66201e06e0d4be4e0ea6b44fc1fdc4216026fa8d35cfcb7fa7e6cea59b

@@ -1,0 +1,15 @@
+{
+  "change": "multi-runtime-support",
+  "phase": "design",
+  "mode": "compact",
+  "canonical_spec": "openspec",
+  "generated_by": "comet-handoff.sh",
+  "context_hash": "7b23cb66201e06e0d4be4e0ea6b44fc1fdc4216026fa8d35cfcb7fa7e6cea59b",
+  "files": [
+    { "path": "openspec/changes/multi-runtime-support/proposal.md", "sha256": "42ad62075be40141b7dafdc12b6e235b325a72908104379a59d19182093bbe28" },
+    { "path": "openspec/changes/multi-runtime-support/design.md", "sha256": "260b98e30126d40af2fc12be82c6b1ff0267c13258e3683ed0e549d7cc8b18f3" },
+    { "path": "openspec/changes/multi-runtime-support/tasks.md", "sha256": "a1afe116b124a14b9bd22b72988fe2b99377798476205992156da7e70835172a" },
+    { "path": "openspec/changes/multi-runtime-support/specs/agent-runtime-switching/spec.md", "sha256": "870c0d853ee3b4eed5e11b27478030bb1baca234617aebd0002d1f53534bc56a" },
+    { "path": "openspec/changes/multi-runtime-support/specs/runtime-ui-selector/spec.md", "sha256": "a1be84fc4da180f9a9fe2c60fea3264451021f62ac3d05c1cc11c3867908da2e" }
+  ]
+}
