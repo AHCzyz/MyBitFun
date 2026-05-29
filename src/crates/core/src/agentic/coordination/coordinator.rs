@@ -183,8 +183,13 @@ async fn run_runtime_event_loop(
     runtime_id_for_log: String,
     session_manager: Arc<SessionManager>,
 ) {
-    let _ = &session_manager; // used in Task 4 (persist calls)
     let _cancel_guard = RuntimeCancelGuard::armed(runtime_turn_cancels, turn_id.clone());
+
+    // F-3: accumulate streamed assistant text + thinking so terminal paths can
+    // persist them to the session store (runtime turns otherwise leave
+    // model_rounds empty → assistant content vanishes on reload).
+    let mut acc_text = String::new();
+    let mut acc_thinking = String::new();
 
     // D8 / F-2: a cancel may have fired during the cold-start
     // create_session window. Check before prompt() so we neither run a
@@ -201,6 +206,11 @@ async fn run_runtime_event_loop(
             },
             Some(EventPriority::High),
         ).await;
+        if let Err(e) = session_manager.cancel_dialog_turn(
+            &session_id, &turn_id, Some(acc_text.clone()), Some(acc_thinking.clone()),
+        ).await {
+            log::warn!("Runtime persist (pre-prompt cancel) failed: turn_id={}, error={}", turn_id, e);
+        }
         let _ = rt_session.dispose().await;
         return;
     }
@@ -225,6 +235,11 @@ async fn run_runtime_event_loop(
                     },
                     Some(EventPriority::High),
                 ).await;
+                if let Err(pe) = session_manager.cancel_dialog_turn(
+                    &session_id, &turn_id, Some(acc_text.clone()), Some(acc_thinking.clone()),
+                ).await {
+                    log::warn!("Runtime persist (prompt-err cancel) failed: turn_id={}, error={}", turn_id, pe);
+                }
                 let _ = rt_session.dispose().await;
                 return;
             }
@@ -235,12 +250,17 @@ async fn run_runtime_event_loop(
                 AgenticEvent::DialogTurnFailed {
                     session_id: session_id.clone(),
                     turn_id: turn_id.clone(),
-                    error: err_msg,
+                    error: err_msg.clone(),
                     error_category: Some(category),
                     error_detail: Some(detail),
                 },
                 Some(EventPriority::High),
             ).await;
+            if let Err(pe) = session_manager.fail_dialog_turn(
+                &session_id, &turn_id, err_msg, Some(acc_text.clone()), Some(acc_thinking.clone()),
+            ).await {
+                log::warn!("Runtime persist (prompt-err fail) failed: turn_id={}, error={}", turn_id, pe);
+            }
             // Session may be in a bad state, dispose instead of caching.
             let _ = rt_session.dispose().await;
             return;
@@ -263,6 +283,11 @@ async fn run_runtime_event_loop(
                     },
                     Some(EventPriority::High),  // F-7: match runtime Aborted arm
                 ).await;
+                if let Err(e) = session_manager.cancel_dialog_turn(
+                    &session_id, &turn_id, Some(acc_text.clone()), Some(acc_thinking.clone()),
+                ).await {
+                    log::warn!("Runtime persist (loop cancel) failed: turn_id={}, error={}", turn_id, e);
+                }
                 let _ = rt_session.dispose().await;
                 return;
             }
@@ -270,6 +295,7 @@ async fn run_runtime_event_loop(
                 let Some(event) = event else { break };
                 match event {
                     RuntimeEvent::TextDelta { delta, .. } => {
+                        acc_text.push_str(&delta);
                         let _ = event_queue.enqueue(
                             AgenticEvent::TextChunk {
                                 session_id: session_id.clone(),
@@ -281,6 +307,7 @@ async fn run_runtime_event_loop(
                         ).await;
                     }
                     RuntimeEvent::ThinkingDelta { delta, .. } => {
+                        acc_thinking.push_str(&delta);
                         let _ = event_queue.enqueue(
                             AgenticEvent::ThinkingChunk {
                                 session_id: session_id.clone(),
@@ -324,6 +351,12 @@ async fn run_runtime_event_loop(
                                     },
                                     Some(EventPriority::High),
                                 ).await;
+                                if let Err(e) = session_manager.complete_dialog_turn(
+                                    &session_id, &turn_id, acc_text.clone(), Some(acc_thinking.clone()),
+                                    TurnStats { total_rounds: 1, total_tools: 0, total_tokens: 0, duration_ms: 0 },
+                                ).await {
+                                    log::warn!("Runtime persist (completed) failed: turn_id={}, error={}", turn_id, e);
+                                }
                                 "completed"
                             }
                             bitfun_runtime_ports::agent_runtime::StopReason::Aborted => {
@@ -334,6 +367,11 @@ async fn run_runtime_event_loop(
                                     },
                                     Some(EventPriority::High),
                                 ).await;
+                                if let Err(e) = session_manager.cancel_dialog_turn(
+                                    &session_id, &turn_id, Some(acc_text.clone()), Some(acc_thinking.clone()),
+                                ).await {
+                                    log::warn!("Runtime persist (aborted) failed: turn_id={}, error={}", turn_id, e);
+                                }
                                 "aborted"
                             }
                             _ => {
@@ -356,6 +394,11 @@ async fn run_runtime_event_loop(
                                         },
                                         Some(EventPriority::High),
                                     ).await;
+                                    if let Err(e) = session_manager.cancel_dialog_turn(
+                                        &session_id, &turn_id, Some(acc_text.clone()), Some(acc_thinking.clone()),
+                                    ).await {
+                                        log::warn!("Runtime persist (stop_reason cancel) failed: turn_id={}, error={}", turn_id, e);
+                                    }
                                     let _ = rt_session.dispose().await;
                                     return;
                                 }
@@ -366,12 +409,17 @@ async fn run_runtime_event_loop(
                                     AgenticEvent::DialogTurnFailed {
                                         session_id: session_id.clone(),
                                         turn_id: turn_id.clone(),
-                                        error: err_msg,
+                                        error: err_msg.clone(),
                                         error_category: Some(category),
                                         error_detail: Some(detail),
                                     },
                                     Some(EventPriority::High),
                                 ).await;
+                                if let Err(e) = session_manager.fail_dialog_turn(
+                                    &session_id, &turn_id, err_msg, Some(acc_text.clone()), Some(acc_thinking.clone()),
+                                ).await {
+                                    log::warn!("Runtime persist (stop_reason fail) failed: turn_id={}, error={}", turn_id, e);
+                                }
                                 "error"
                             }
                         };
@@ -401,6 +449,11 @@ async fn run_runtime_event_loop(
                                 },
                                 Some(EventPriority::High),
                             ).await;
+                            if let Err(e) = session_manager.cancel_dialog_turn(
+                                &session_id, &turn_id, Some(acc_text.clone()), Some(acc_thinking.clone()),
+                            ).await {
+                                log::warn!("Runtime persist (stream-error cancel) failed: turn_id={}, error={}", turn_id, e);
+                            }
                             let _ = rt_session.dispose().await;
                             return;
                         }
@@ -410,12 +463,17 @@ async fn run_runtime_event_loop(
                             AgenticEvent::DialogTurnFailed {
                                 session_id: session_id.clone(),
                                 turn_id: turn_id.clone(),
-                                error: message,
+                                error: message.clone(),
                                 error_category: Some(category),
                                 error_detail: Some(detail),
                             },
                             Some(EventPriority::High),
                         ).await;
+                        if let Err(e) = session_manager.fail_dialog_turn(
+                            &session_id, &turn_id, message, Some(acc_text.clone()), Some(acc_thinking.clone()),
+                        ).await {
+                            log::warn!("Runtime persist (stream-error fail) failed: turn_id={}, error={}", turn_id, e);
+                        }
                         // Session may be in a bad state after a bridge error
                         // (e.g. stuck in catch block, SDK retry state dirty).
                         // Dispose instead of caching — matches prompt() Err.
@@ -6403,6 +6461,148 @@ mod tests {
             "INVARIANT VIOLATED: a cancelled turn surfaced as Failed"
         );
         assert!(cancels.get("tid").is_none(), "cancel guard did not remove entry");
+    }
+
+    #[tokio::test]
+    async fn runtime_event_loop_persists_completed_text_and_thinking_for_reload() {
+        // F-3: streamed text + thinking on a Completed runtime turn must be
+        // persisted to model_rounds and visible after reload.
+        let ws = TestWs::new();
+        let pm = Arc::new(
+            crate::agentic::persistence::PersistenceManager::new(ws.path_manager()).expect("pm"),
+        );
+        let manager = Arc::new(crate::agentic::session::SessionManager::new(
+            Arc::new(crate::agentic::session::SessionContextStore::new()),
+            pm.clone(),
+            crate::agentic::session::SessionManagerConfig {
+                max_active_sessions: 100,
+                session_idle_timeout: std::time::Duration::from_secs(3600),
+                auto_save_interval: std::time::Duration::from_secs(300),
+                enable_persistence: true,
+                prompt_cache_policy: crate::agentic::session::PromptCachePolicy::default(),
+            },
+        ));
+        let session = manager
+            .create_session(
+                "rt-complete".into(),
+                "agentic".into(),
+                crate::agentic::core::SessionConfig {
+                    workspace_path: Some(ws.path.to_string_lossy().to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("session");
+        let turn_id = manager
+            .start_dialog_turn(&session.session_id, "agentic".into(), "hi".into(), None, None, None)
+            .await
+            .expect("turn");
+
+        let (tx, rx) = mpsc::channel::<RuntimeEvent>(8);
+        tx.send(RuntimeEvent::ThinkingDelta { delta: "let me think".into(), metadata: HashMap::new() }).await.unwrap();
+        tx.send(RuntimeEvent::TextDelta { delta: "hello ".into(), metadata: HashMap::new() }).await.unwrap();
+        tx.send(RuntimeEvent::TextDelta { delta: "world".into(), metadata: HashMap::new() }).await.unwrap();
+        tx.send(RuntimeEvent::TurnEnd { stop_reason: StopReason::Completed, metadata: HashMap::new() }).await.unwrap();
+        drop(tx);
+
+        let disposed = Arc::new(AtomicBool::new(false));
+        let prompt_called = Arc::new(AtomicBool::new(false));
+        let session_box = fake_session(Some(rx), disposed.clone(), prompt_called.clone());
+        let cancel = CancellationToken::new();
+        let cancels: Arc<DashMap<String, CancellationToken>> = Arc::new(DashMap::new());
+        let queue = Arc::new(EventQueue::new(EventQueueConfig::default()));
+        let slot: Arc<tokio::sync::Mutex<Option<Box<dyn AgentSession>>>> =
+            Arc::new(tokio::sync::Mutex::new(None));
+
+        run_runtime_event_loop(
+            session_box, "hi".into(), cancel, cancels,
+            queue.clone(), slot.clone(),
+            session.session_id.clone(), turn_id.clone(), "claude".into(), manager.clone(),
+        ).await;
+
+        let reloaded = pm
+            .load_dialog_turn(&ws.path, &session.session_id, 0)
+            .await
+            .expect("load")
+            .expect("turn exists");
+        let text: String = reloaded.model_rounds.iter()
+            .flat_map(|r| r.text_items.iter()).map(|i| i.content.clone()).collect();
+        let thinking: String = reloaded.model_rounds.iter()
+            .flat_map(|r| r.thinking_items.iter()).map(|i| i.content.clone()).collect();
+        assert_eq!(text, "hello world", "completed runtime turn must persist accumulated text");
+        assert_eq!(thinking, "let me think", "completed runtime turn must persist accumulated thinking");
+    }
+
+    #[tokio::test]
+    async fn runtime_event_loop_persists_partial_content_on_cancel() {
+        // F-3: partial text + thinking streamed before a cancel must survive reload.
+        let ws = TestWs::new();
+        let pm = Arc::new(
+            crate::agentic::persistence::PersistenceManager::new(ws.path_manager()).expect("pm"),
+        );
+        let manager = Arc::new(crate::agentic::session::SessionManager::new(
+            Arc::new(crate::agentic::session::SessionContextStore::new()),
+            pm.clone(),
+            crate::agentic::session::SessionManagerConfig {
+                max_active_sessions: 100,
+                session_idle_timeout: std::time::Duration::from_secs(3600),
+                auto_save_interval: std::time::Duration::from_secs(300),
+                enable_persistence: true,
+                prompt_cache_policy: crate::agentic::session::PromptCachePolicy::default(),
+            },
+        ));
+        let session = manager
+            .create_session(
+                "rt-cancel".into(),
+                "agentic".into(),
+                crate::agentic::core::SessionConfig {
+                    workspace_path: Some(ws.path.to_string_lossy().to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("session");
+        let turn_id = manager
+            .start_dialog_turn(&session.session_id, "agentic".into(), "hi".into(), None, None, None)
+            .await
+            .expect("turn");
+
+        let (_tx, rx) = mpsc::channel::<RuntimeEvent>(8);
+        _tx.send(RuntimeEvent::ThinkingDelta { delta: "reasoning".into(), metadata: HashMap::new() }).await.unwrap();
+        _tx.send(RuntimeEvent::TextDelta { delta: "partial".into(), metadata: HashMap::new() }).await.unwrap();
+        // keep _tx alive so the stream stays open and the cancel arm wins
+
+        let disposed = Arc::new(AtomicBool::new(false));
+        let prompt_called = Arc::new(AtomicBool::new(false));
+        let session_box = fake_session(Some(rx), disposed.clone(), prompt_called.clone());
+        let cancel = CancellationToken::new();
+        let cancels: Arc<DashMap<String, CancellationToken>> = Arc::new(DashMap::new());
+        let queue = Arc::new(EventQueue::new(EventQueueConfig::default()));
+        let slot: Arc<tokio::sync::Mutex<Option<Box<dyn AgentSession>>>> =
+            Arc::new(tokio::sync::Mutex::new(None));
+
+        let task = tokio::spawn(run_runtime_event_loop(
+            session_box, "hi".into(), cancel.clone(), cancels.clone(),
+            queue.clone(), slot.clone(),
+            session.session_id.clone(), turn_id.clone(), "claude".into(), manager.clone(),
+        ));
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        cancel.cancel();
+        tokio::time::timeout(std::time::Duration::from_millis(500), task)
+            .await.expect("helper exit").expect("join");
+
+        let reloaded = pm
+            .load_dialog_turn(&ws.path, &session.session_id, 0)
+            .await
+            .expect("load")
+            .expect("turn exists");
+        let text: String = reloaded.model_rounds.iter()
+            .flat_map(|r| r.text_items.iter()).map(|i| i.content.clone()).collect();
+        let thinking: String = reloaded.model_rounds.iter()
+            .flat_map(|r| r.thinking_items.iter()).map(|i| i.content.clone()).collect();
+        assert_eq!(text, "partial", "cancelled runtime turn must persist partial text");
+        assert_eq!(thinking, "reasoning", "cancelled runtime turn must persist partial thinking");
+        assert_eq!(reloaded.status, crate::service::session::TurnStatus::Cancelled);
     }
 
 }
