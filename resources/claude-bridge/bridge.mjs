@@ -22,6 +22,26 @@
 import { query } from '@anthropic-ai/claude-agent-sdk';
 import { createInterface } from 'node:readline';
 
+// ── Timeout configuration ───────────────────────────────────────────────────
+//
+// Two-tier timeout protects against (a) HTTP-layer hangs that prevent any
+// SDK message from arriving and (b) mid-stream stalls where the API stops
+// emitting tokens but the socket stays open.
+//
+// Both default to 120 s; both are env-overridable; both clamped to ≥ 1 s.
+function parseTimeoutMs(raw, fallback) {
+  const n = parseInt(raw ?? '', 10);
+  return Number.isFinite(n) && n >= 1000 ? n : fallback;
+}
+const FIRST_EVENT_TIMEOUT_MS = parseTimeoutMs(
+  process.env.BITFUN_CLAUDE_BRIDGE_FIRST_EVENT_TIMEOUT_MS,
+  120000,
+);
+const IDLE_TIMEOUT_MS = parseTimeoutMs(
+  process.env.BITFUN_CLAUDE_BRIDGE_IDLE_TIMEOUT_MS,
+  120000,
+);
+
 // ── Message translation ─────────────────────────────────────────────────────
 
 /**
@@ -194,8 +214,41 @@ async function main() {
         options,
       });
 
-      for await (const msg of messages) {
-        const events = translateMessage(msg);
+      // Manual iteration with first-event + idle timeouts. Each iter.next()
+      // is raced against a fresh timer; on expiry we throw to the outer
+      // catch (which already emits {error, turn_end}) and best-effort
+      // ask the iterator to clean up via .return().
+      const iter = messages[Symbol.asyncIterator]();
+      let firstEvent = true;
+      while (true) {
+        const timeoutMs = firstEvent ? FIRST_EVENT_TIMEOUT_MS : IDLE_TIMEOUT_MS;
+        const phase = firstEvent ? 'first response' : 'next event';
+        let timer;
+        const timeoutPromise = new Promise((_, reject) => {
+          timer = setTimeout(
+            () =>
+              reject(
+                new Error(`Claude SDK ${phase} timed out after ${timeoutMs}ms`),
+              ),
+            timeoutMs,
+          );
+        });
+        let step;
+        try {
+          step = await Promise.race([iter.next(), timeoutPromise]);
+        } catch (err) {
+          clearTimeout(timer);
+          try {
+            await iter.return?.();
+          } catch {
+            // ignore cleanup failure
+          }
+          throw err;
+        }
+        clearTimeout(timer);
+        if (step.done) break;
+        firstEvent = false;
+        const events = translateMessage(step.value);
         for (const ev of events) {
           process.stdout.write(JSON.stringify(ev) + '\n');
         }
