@@ -79,6 +79,52 @@ fn classify_runtime_error(message: &str, kind: Option<&PortErrorKind>) -> ErrorC
     classify_ai_error_message(message)
 }
 
+/// RAII guard for a spawn task that owns a turn's in-flight registration.
+///
+/// On drop (any exit path — early return, normal completion, panic unwind) it
+/// decrements the per-session `active_turns_per_session` counter and resets
+/// `Session.state` from `Processing` back to `Idle` if it still matches the
+/// turn id we registered for.
+///
+/// Used by both the bitfun spawn task and the runtime (claude / OMP) spawn
+/// task so panics and future early returns cannot leak the counter (which
+/// would deadline-out every subsequent `wait_session_drained`) nor leave the
+/// session stuck in `Processing` (frontend spinner never stops).
+///
+/// `Drop::drop` is synchronous, so the state reset is in-memory only.
+/// `restore_session` already normalizes any persisted non-Idle state back to
+/// Idle on application restart.
+struct TurnLifecycleGuard {
+    session_manager: Arc<SessionManager>,
+    session_id: String,
+    turn_id: String,
+    active_counter: Arc<AtomicUsize>,
+}
+
+impl TurnLifecycleGuard {
+    fn new(
+        session_manager: Arc<SessionManager>,
+        session_id: String,
+        turn_id: String,
+        active_counter: Arc<AtomicUsize>,
+    ) -> Self {
+        Self {
+            session_manager,
+            session_id,
+            turn_id,
+            active_counter,
+        }
+    }
+}
+
+impl Drop for TurnLifecycleGuard {
+    fn drop(&mut self) {
+        self.active_counter.fetch_sub(1, Ordering::SeqCst);
+        self.session_manager
+            .reset_session_state_if_processing(&self.session_id, &self.turn_id);
+    }
+}
+
 const MANUAL_COMPACTION_COMMAND: &str = "/compact";
 const CONTEXT_COMPRESSION_TOOL_NAME: &str = "ContextCompression";
 const DEFAULT_SUBAGENT_MAX_CONCURRENCY: usize = 5;
@@ -2656,6 +2702,18 @@ Update the persona files and delete BOOTSTRAP.md as soon as bootstrap is complet
             let session_slot_clone = session_slot.clone();
 
             tokio::spawn(async move {
+                // RAII guard: on any exit path (including panic unwind), decrement
+                // the in-flight counter and reset Processing → Idle if this turn
+                // still owns the session state. Replaces the manual fetch_sub +
+                // reset_session_state_if_processing triples that previously sat
+                // on each return path. See TurnLifecycleGuard at module top.
+                let _guard = TurnLifecycleGuard::new(
+                    session_manager.clone(),
+                    session_id_clone.clone(),
+                    turn_id_clone.clone(),
+                    active_counter.clone(),
+                );
+
                 let mut stream = match rt_session.prompt(&wrapped_user_input, vec![]).await {
                     Ok(s) => s,
                     Err(e) => {
@@ -2674,13 +2732,6 @@ Update the persona files and delete BOOTSTRAP.md as soon as bootstrap is complet
                         ).await;
                         // Session may be in a bad state, dispose instead of caching.
                         let _ = rt_session.dispose().await;
-                        // Mirror the success-path tail so the session state machine
-                        // doesn't get stuck in Processing on a prompt() failure.
-                        active_counter.fetch_sub(1, Ordering::SeqCst);
-                        session_manager.reset_session_state_if_processing(
-                            &session_id_clone,
-                            &turn_id_clone,
-                        );
                         return;
                     }
                 };
@@ -2795,11 +2846,6 @@ Update the persona files and delete BOOTSTRAP.md as soon as bootstrap is complet
                             // (e.g. stuck in catch block, SDK retry state dirty).
                             // Dispose instead of caching — matches prompt() Err.
                             let _ = rt_session.dispose().await;
-                            active_counter.fetch_sub(1, Ordering::SeqCst);
-                            session_manager.reset_session_state_if_processing(
-                                &session_id_clone,
-                                &turn_id_clone,
-                            );
                             return;
                         }
                         _ => {}
@@ -2817,12 +2863,7 @@ Update the persona files and delete BOOTSTRAP.md as soon as bootstrap is complet
                 if let Some(prev_session) = displaced {
                     let _ = prev_session.dispose().await;
                 }
-
-                active_counter.fetch_sub(1, Ordering::SeqCst);
-                session_manager.reset_session_state_if_processing(
-                    &session_id_clone,
-                    &turn_id_clone,
-                );
+                // _guard drops here: counter -= 1 and reset Processing → Idle.
             });
 
             return Ok(());
@@ -3027,44 +3068,9 @@ Update the persona files and delete BOOTSTRAP.md as soon as bootstrap is complet
         tokio::spawn(async move {
             // RAII guard: on drop (ANY exit path, including panic), decrements
             // the in-flight counter and resets Processing → Idle only if this
-            // task still owns the current turn.
-            //
-            // This is the single source of truth for "is this spawn active?".
-            // Because `Drop` is synchronous we use an in-memory-only state
-            // update here; the async persistence of the state change is done
-            // explicitly in the spawn body below.
-            struct SessionExecutionGuard {
-                session_manager: Arc<SessionManager>,
-                session_id: String,
-                turn_id: String,
-                active_counter: Arc<AtomicUsize>,
-            }
-            impl SessionExecutionGuard {
-                fn new(
-                    session_manager: Arc<SessionManager>,
-                    session_id: String,
-                    turn_id: String,
-                    active_counter: Arc<AtomicUsize>,
-                ) -> Self {
-                    Self {
-                        session_manager,
-                        session_id,
-                        turn_id,
-                        active_counter,
-                    }
-                }
-            }
-            impl Drop for SessionExecutionGuard {
-                fn drop(&mut self) {
-                    self.active_counter.fetch_sub(1, Ordering::SeqCst);
-                    // If the session is still in Processing (abnormal exit),
-                    // synchronously reset to Idle so the user is never stuck.
-                    self.session_manager
-                        .reset_session_state_if_processing(&self.session_id, &self.turn_id);
-                }
-            }
-
-            let _guard = SessionExecutionGuard::new(
+            // task still owns the current turn. See TurnLifecycleGuard at the
+            // top of this module — shared with the runtime spawn task.
+            let _guard = TurnLifecycleGuard::new(
                 session_manager.clone(),
                 session_id_clone.clone(),
                 turn_id_clone.clone(),
