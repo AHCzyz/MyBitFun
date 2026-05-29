@@ -1,0 +1,16 @@
+workflow: full
+phase: design
+build_mode: null
+isolation: null
+verify_mode: null
+base_ref: 8d8f22b57a4b98092c7044e6481a9996db52bcec
+design_doc: docs/superpowers/specs/2026-05-30-runtime-turn-persistence-design.md
+plan: null
+verify_result: pending
+verification_report: null
+branch_status: pending
+created_at: 2026-05-30
+verified_at: null
+archived: false
+handoff_context: openspec/changes/runtime-turn-persistence/.comet/handoff/design-context.json
+handoff_hash: 904dd26254359952fa1712b97046c23d0fb24b71318f15efd7dc1b3eff4c0965

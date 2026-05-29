@@ -1,0 +1,14 @@
+{
+  "change": "runtime-turn-persistence",
+  "phase": "design",
+  "mode": "compact",
+  "canonical_spec": "openspec",
+  "generated_by": "comet-handoff.sh",
+  "context_hash": "904dd26254359952fa1712b97046c23d0fb24b71318f15efd7dc1b3eff4c0965",
+  "files": [
+    { "path": "openspec/changes/runtime-turn-persistence/proposal.md", "sha256": "36236be95f91462880e81e6e12cbdd26303cd0cf974d3f02799edc8f5e396645" },
+    { "path": "openspec/changes/runtime-turn-persistence/design.md", "sha256": "f272bbfbded0d6af122368c6a2a57db49efc8c78c18576ca9fe3666b0e4459bd" },
+    { "path": "openspec/changes/runtime-turn-persistence/tasks.md", "sha256": "f5ca6a06d32dad6aebde606f144199147e064bfa3315933ec2ca992d49b600b8" },
+    { "path": "openspec/changes/runtime-turn-persistence/specs/runtime-turn-persistence/spec.md", "sha256": "7584dcab588dc191ae73a0e1a525d5abdc01ef8a12d4933c679721af915d80de" }
+  ]
+}
