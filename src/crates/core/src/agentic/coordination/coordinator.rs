@@ -60,27 +60,23 @@ use tokio_util::sync::CancellationToken;
 
 /// Map a runtime-path error to an `ErrorCategory` for `DialogTurnFailed`.
 ///
-/// Strategy: try message-string heuristics first (catches provider-embedded
-/// signals like rate-limit / quota that arrive in the message body of a
-/// `PortErrorKind::Backend`). Fall back to a structural mapping of the
-/// `PortErrorKind` variant. If neither yields a useful category, return
-/// `ModelError` — runtime errors that reach this point are, definitionally,
-/// model-side. See `docs/superpowers/specs/...` design doc D1.
+/// Strategy: structural `PortErrorKind` first (more reliable for runtime-path
+/// errors where the message is often a generic debug string like
+/// "PermissionDenied: ANTHROPIC_API_KEY …"). Message-string heuristics only
+/// run for `Backend` (where the SDK embeds provider signals in the body) or
+/// when no kind is available (bridge-originated error events).
 fn classify_runtime_error(message: &str, kind: Option<&PortErrorKind>) -> ErrorCategory {
-    let from_message = classify_ai_error_message(message);
-    if !matches!(from_message, ErrorCategory::Unknown) {
-        return from_message;
-    }
     match kind {
-        Some(PortErrorKind::Timeout) => ErrorCategory::Timeout,
-        Some(PortErrorKind::PermissionDenied) => ErrorCategory::Auth,
-        Some(PortErrorKind::NotAvailable) => ErrorCategory::ProviderUnavailable,
+        Some(PortErrorKind::Timeout) => return ErrorCategory::Timeout,
+        Some(PortErrorKind::PermissionDenied) => return ErrorCategory::Auth,
+        Some(PortErrorKind::NotAvailable) => return ErrorCategory::ProviderUnavailable,
         Some(PortErrorKind::InvalidRequest) | Some(PortErrorKind::NotFound) => {
-            ErrorCategory::InvalidRequest
+            return ErrorCategory::InvalidRequest
         }
-        Some(PortErrorKind::Cancelled) => ErrorCategory::Unknown,
-        Some(PortErrorKind::Backend) | None => ErrorCategory::ModelError,
+        Some(PortErrorKind::Cancelled) => return ErrorCategory::Unknown,
+        Some(PortErrorKind::Backend) | None => {}
     }
+    classify_ai_error_message(message)
 }
 
 const MANUAL_COMPACTION_COMMAND: &str = "/compact";
@@ -2795,7 +2791,16 @@ Update the persona files and delete BOOTSTRAP.md as soon as bootstrap is complet
                                 },
                                 Some(EventPriority::High),
                             ).await;
-                            break;
+                            // Session may be in a bad state after a bridge error
+                            // (e.g. stuck in catch block, SDK retry state dirty).
+                            // Dispose instead of caching — matches prompt() Err.
+                            let _ = rt_session.dispose().await;
+                            active_counter.fetch_sub(1, Ordering::SeqCst);
+                            session_manager.reset_session_state_if_processing(
+                                &session_id_clone,
+                                &turn_id_clone,
+                            );
+                            return;
                         }
                         _ => {}
                     }
@@ -3413,14 +3418,13 @@ Update the persona files and delete BOOTSTRAP.md as soon as bootstrap is complet
     /// dispose cached runtime session → drop the active-turn counter →
     /// hand off to `session_manager` for its own stores + persistence.
     ///
-    /// Future deletion paths MUST go through this function. Direct
-    /// calls to `session_manager.delete_session` are acceptable only
-    /// when the session is known not to be loaded in memory — i.e.
-    /// there is no `runtime_sessions` or `active_turns_per_session`
-    /// entry for it (e.g. the persistence-only purge in
-    /// `session_api.rs`). Anything that touches a live session must
-    /// route here so runtime sessions don't accumulate on the heap
-    /// and bridge child processes don't pile up.
+    /// Future deletion paths MUST go through this function. The only
+    /// acceptable bypass is `session_api.rs`'s `delete_persisted_session`
+    /// which instantiates `PersistenceManager` directly and only touches
+    /// on-disk data — it never interacts with `session_manager` or
+    /// coordinator in-memory state, and is safe only when the session is
+    /// known not to be loaded in memory (i.e. there is no
+    /// `runtime_sessions` or `active_turns_per_session` entry for it).
     pub async fn delete_session(
         &self,
         workspace_path: &Path,

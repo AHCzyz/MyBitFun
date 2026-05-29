@@ -239,7 +239,10 @@ async function main() {
         } catch (err) {
           clearTimeout(timer);
           try {
-            await iter.return?.();
+            await Promise.race([
+              iter.return?.() ?? Promise.resolve(),
+              new Promise((r) => setTimeout(r, 2000)),
+            ]);
           } catch {
             // ignore cleanup failure
           }
