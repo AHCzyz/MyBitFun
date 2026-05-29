@@ -34,6 +34,20 @@ base-ref: 70ee5ca0d99bf5863c9dbdbd6acb8f3f78baf1e5
 
 ---
 
+## ⚠️ B-extended Scope Revision (2026-05-30, mid-build)
+
+**Authoritative on the thinking dimension:** the design doc was revised from "text only" (D-1=A) to **text + thinking** (D-1=B-extended) after empirical evidence (release persists thinking in assistant/runtime mode, survives restart; bitfun/professional mode never has thinking → no inconsistency). Read the design doc's "方案:B-extended" section. The deltas to the tasks below:
+
+- **Helper rename + signature:** `inject_partial_text_if_absent(turn, text, ts)` → **`inject_partial_content_if_absent(turn, text, thinking, ts)`**. Body: skip only if BOTH text & thinking empty; same `has_assistant_text` guard; build one round, push a `TextItemData` iff text non-empty AND push a `ThinkingItemData` iff thinking non-empty. `ThinkingItemData` required fields: `id, content, is_streaming:false, is_collapsed:true, timestamp, order_index:Some(0), status:Some("completed"), is_subagent_item:None, parent_task_tool_id:None, subagent_session_id:None`.
+- **Task 1:** helper takes thinking; `complete_dialog_turn` fallback calls `inject_partial_content_if_absent(&mut turn, &final_response, thinking.as_deref().unwrap_or(""), completion_timestamp)` — but `complete_dialog_turn` doesn't have a thinking param YET in Task 1, so in Task 1 pass `""` for thinking (text behaviour unchanged; characterization test still valid).
+- **Task 2:** ALSO add `thinking: Option<String>` to `complete_dialog_turn` (last param) and update its bitfun caller `persist_completed_dialog_turn` (anchor `.complete_dialog_turn(`) to pass `None`. `cancel_dialog_turn`/`fail_dialog_turn` get BOTH `partial_text: Option<String>` and `partial_thinking: Option<String>`; their helper call passes both. Coordinator callers (`persist_cancelled`/`persist_failed`) pass `None, None`. Add thinking assertions to the new tests (reload → thinking_items content present).
+- **Task 4:** add `let mut acc_thinking = String::new();`; in the `ThinkingDelta` arm add `acc_thinking.push_str(&delta);` before the ThinkingChunk emit. Every persist call passes thinking too: Completed → `complete_dialog_turn(&sid,&tid, acc_text.clone(), Some(acc_thinking.clone()), stats)`; cancel paths → `cancel_dialog_turn(&sid,&tid, Some(acc_text.clone()), Some(acc_thinking.clone()))`; fail paths → `fail_dialog_turn(&sid,&tid, msg, Some(acc_text.clone()), Some(acc_thinking.clone()))`. Integration tests assert both text and thinking after reload.
+- **Task 6:** add V-7 (Completed with only thinking, no text → round has thinking_items, empty text_items).
+
+Everything else in the tasks below (test harness patterns, commit cadence, grep anchors, the two resolved uncertainties) stays valid. **Resolved uncertainties:** `TurnStats` = `crate::agentic::core::TurnStats` (test) / bare `TurnStats` (impl, already imported); `TestWorkspace` uses `std::env::temp_dir()` + `PathManager::with_user_root_for_tests(self.path.join("user-root"))`, NOT `tempfile`/`with_root`.
+
+---
+
 ## Task 1: Extract `inject_partial_text_if_absent` helper (zero behaviour change)
 
 **Files:**
