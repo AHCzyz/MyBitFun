@@ -250,6 +250,24 @@ function pipeToFile(res, dest) {
   });
 }
 
+// ── Integrity verification ───────────────────────────────────────────────────
+
+function parseAssetDigest(value) {
+  if (typeof value !== 'string') return null;
+  const m = SHA256_HEX.exec(value.toLowerCase());
+  return m ? Buffer.from(m[1], 'hex') : null;
+}
+
+function sha256File(path) {
+  return new Promise((resolve, reject) => {
+    const hash = createHash('sha256');
+    createReadStream(path)
+      .on('error', reject)
+      .on('data', (chunk) => hash.update(chunk))
+      .on('end', () => resolve(hash.digest()));
+  });
+}
+
 // ── Wrappers ─────────────────────────────────────────────────────────────────
 
 async function fetchJson(url) {
@@ -306,7 +324,26 @@ export async function ensureOmpBinary() {
     return;
   }
 
-  const url = `https://github.com/${OMP_REPO}/releases/download/${tag}/${target.remoteName}`;
+  const asset = Array.isArray(release.assets)
+    ? release.assets.find((a) => a && a.name === target.remoteName)
+    : null;
+  if (!asset) {
+    console.warn(`[runtime-resources] WARNING: No asset named '${target.remoteName}' in OMP release ${tag}.`);
+    console.warn('[runtime-resources] OMP runtime will not be available in this build.');
+    return;
+  }
+
+  const expected = parseAssetDigest(asset.digest);
+  if (!expected) {
+    console.warn(
+      `[runtime-resources] WARNING: OMP asset '${target.remoteName}' in release ${tag} has no/malformed digest (got: ${JSON.stringify(asset.digest)}).`
+    );
+    console.warn('[runtime-resources] Refusing to install without an integrity check. OMP runtime will not be available in this build.');
+    return;
+  }
+
+  const url = asset.browser_download_url
+    || `https://github.com/${OMP_REPO}/releases/download/${tag}/${target.remoteName}`;
   console.log(`[runtime-resources] Downloading OMP ${tag}: ${target.remoteName} (${target.localName})...`);
 
   mkdirSync(ompDir, { recursive: true });
@@ -320,12 +357,27 @@ export async function ensureOmpBinary() {
     return;
   }
 
+  let actual;
+  try {
+    actual = await sha256File(localPath);
+  } catch (e) {
+    try { unlinkSync(localPath); } catch {}
+    throw new Error(`Failed to hash downloaded OMP binary: ${e.message}`);
+  }
+
+  if (actual.length !== expected.length || !timingSafeEqual(actual, expected)) {
+    try { unlinkSync(localPath); } catch {}
+    throw new Error(
+      `OMP integrity check failed for ${target.remoteName}: expected ${expected.toString('hex')}, got ${actual.toString('hex')}`
+    );
+  }
+
   if (process.platform !== 'win32') {
     chmodSync(localPath, 0o755);
   }
 
   writeFileSync(versionFile, `${tag}\n`, 'utf8');
-  console.log(`[runtime-resources] OMP ${tag} downloaded: ${target.localName}`);
+  console.log(`[runtime-resources] OMP ${tag} downloaded and verified: ${target.localName}`);
 }
 
 // ---------------------------------------------------------------------------
