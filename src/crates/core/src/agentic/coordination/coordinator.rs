@@ -2640,11 +2640,20 @@ Update the persona files and delete BOOTSTRAP.md as soon as bootstrap is complet
                                 session_id: session_id_clone.clone(),
                                 turn_id: turn_id_clone.clone(),
                                 error: e.to_string(),
+                                error_category: None,
+                                error_detail: None,
                             },
                             Some(EventPriority::High),
                         ).await;
                         // Session may be in a bad state, dispose instead of caching.
                         let _ = rt_session.dispose().await;
+                        // Mirror the success-path tail so the session state machine
+                        // doesn't get stuck in Processing on a prompt() failure.
+                        active_counter.fetch_sub(1, Ordering::SeqCst);
+                        session_manager.reset_session_state_if_processing(
+                            &session_id_clone,
+                            &turn_id_clone,
+                        );
                         return;
                     }
                 };
@@ -2757,9 +2766,16 @@ Update the persona files and delete BOOTSTRAP.md as soon as bootstrap is complet
                 }
 
                 // Return the session to cache for reuse by the next turn.
+                // If a concurrent turn already raced ahead and stashed its own
+                // session here, replace() returns it so we can dispose it
+                // cleanly instead of dropping it on the floor (orphaning the
+                // bridge child process).
                 let mut slot_guard = session_slot_clone.lock().await;
-                *slot_guard = Some(rt_session);
+                let displaced = slot_guard.replace(rt_session);
                 drop(slot_guard);
+                if let Some(prev_session) = displaced {
+                    let _ = prev_session.dispose().await;
+                }
 
                 active_counter.fetch_sub(1, Ordering::SeqCst);
                 session_manager.reset_session_state_if_processing(
