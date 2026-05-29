@@ -3272,8 +3272,12 @@ impl SessionManager {
     /// Mark a dialog turn as cancelled and persist it. Unlike
     /// `complete_dialog_turn`, this writes `TurnStatus::Cancelled` so the
     /// frontend / persistence layer can distinguish a user-cancelled turn
-    /// from a fully-completed one. Any partial assistant content that was
-    /// already streamed is preserved in `model_rounds`.
+    /// from a fully-completed one. The turn's existing `model_rounds` are
+    /// persisted as-is; runtime (claude/OMP) turns, whose model_rounds are
+    /// otherwise empty, supply their streamed-so-far text/thinking via
+    /// `partial_text` / `partial_thinking`, which are injected only when no
+    /// assistant text already exists (so the bitfun path passing None is a
+    /// no-op).
     pub async fn cancel_dialog_turn(
         &self,
         session_id: &str,
