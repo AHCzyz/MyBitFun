@@ -22,7 +22,7 @@ use crate::service::config::{
 };
 use crate::service::session::{
     DialogTurnData, DialogTurnKind, ModelRoundData, SessionMetadata, SessionRelationship,
-    SessionRelationshipKind, TextItemData, TurnStatus, UserMessageData,
+    SessionRelationshipKind, TextItemData, ThinkingItemData, TurnStatus, UserMessageData,
 };
 use crate::service::snapshot::ensure_snapshot_manager_for_workspace;
 use crate::service::workspace::get_global_workspace_service;
@@ -117,6 +117,84 @@ struct SessionCleanupCandidate {
     session_id: String,
     updated_at: SystemTime,
     last_activity_at: SystemTime,
+}
+
+/// Inject `text` / `thinking` as a single synthetic "completed" model round,
+/// but only when the turn has no existing non-empty assistant text. No-op when
+/// both are empty or when assistant text already exists (idempotent; safe for
+/// the bitfun path which passes empty/None). Text goes into `text_items`,
+/// thinking into `thinking_items` (separate arrays, no interleaving).
+fn inject_partial_content_if_absent(
+    turn: &mut DialogTurnData,
+    text: &str,
+    thinking: &str,
+    ts: u64,
+) {
+    if text.trim().is_empty() && thinking.trim().is_empty() {
+        return;
+    }
+    let has_assistant_text = turn.model_rounds.iter().any(|round| {
+        round
+            .text_items
+            .iter()
+            .any(|item| !item.content.trim().is_empty())
+    });
+    if has_assistant_text {
+        return;
+    }
+    let round_index = turn.model_rounds.len();
+    let mut text_items = Vec::new();
+    if !text.trim().is_empty() {
+        text_items.push(TextItemData {
+            id: format!("{}-final-text", turn.turn_id),
+            content: text.to_string(),
+            is_streaming: false,
+            timestamp: ts,
+            is_markdown: true,
+            order_index: Some(0),
+            is_subagent_item: None,
+            parent_task_tool_id: None,
+            subagent_session_id: None,
+            status: Some("completed".to_string()),
+        });
+    }
+    let mut thinking_items = Vec::new();
+    if !thinking.trim().is_empty() {
+        thinking_items.push(ThinkingItemData {
+            id: format!("{}-final-thinking", turn.turn_id),
+            content: thinking.to_string(),
+            is_streaming: false,
+            is_collapsed: true,
+            timestamp: ts,
+            order_index: Some(0),
+            status: Some("completed".to_string()),
+            is_subagent_item: None,
+            parent_task_tool_id: None,
+            subagent_session_id: None,
+        });
+    }
+    turn.model_rounds.push(ModelRoundData {
+        id: format!("{}-final-round", turn.turn_id),
+        turn_id: turn.turn_id.clone(),
+        round_index,
+        timestamp: ts,
+        text_items,
+        tool_items: Vec::new(),
+        thinking_items,
+        start_time: ts,
+        end_time: Some(ts),
+        duration_ms: Some(0),
+        provider_id: None,
+        model_id: None,
+        model_alias: None,
+        first_chunk_ms: None,
+        first_visible_output_ms: None,
+        stream_duration_ms: None,
+        attempt_count: None,
+        failure_category: None,
+        token_details: None,
+        status: "completed".to_string(),
+    });
 }
 
 impl SessionManager {
@@ -3080,48 +3158,7 @@ impl SessionManager {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
-        let has_assistant_text = turn.model_rounds.iter().any(|round| {
-            round
-                .text_items
-                .iter()
-                .any(|item| !item.content.trim().is_empty())
-        });
-        if !has_assistant_text && !final_response.trim().is_empty() {
-            let round_index = turn.model_rounds.len();
-            turn.model_rounds.push(ModelRoundData {
-                id: format!("{}-final-round", turn.turn_id),
-                turn_id: turn.turn_id.clone(),
-                round_index,
-                timestamp: completion_timestamp,
-                text_items: vec![TextItemData {
-                    id: format!("{}-final-text", turn.turn_id),
-                    content: final_response.clone(),
-                    is_streaming: false,
-                    timestamp: completion_timestamp,
-                    is_markdown: true,
-                    order_index: Some(0),
-                    is_subagent_item: None,
-                    parent_task_tool_id: None,
-                    subagent_session_id: None,
-                    status: Some("completed".to_string()),
-                }],
-                tool_items: Vec::new(),
-                thinking_items: Vec::new(),
-                start_time: completion_timestamp,
-                end_time: Some(completion_timestamp),
-                duration_ms: Some(0),
-                provider_id: None,
-                model_id: None,
-                model_alias: None,
-                first_chunk_ms: None,
-                first_visible_output_ms: None,
-                stream_duration_ms: None,
-                attempt_count: None,
-                failure_category: None,
-                token_details: None,
-                status: "completed".to_string(),
-            });
-        }
+        inject_partial_content_if_absent(&mut turn, &final_response, "", completion_timestamp);
         turn.status = TurnStatus::Completed;
         turn.duration_ms = Some(stats.duration_ms);
         turn.end_time = Some(completion_timestamp);
@@ -4073,6 +4110,68 @@ mod tests {
             context_window: Some(context_window),
             ..Default::default()
         }
+    }
+
+    #[tokio::test]
+    async fn complete_dialog_turn_injects_final_response_when_no_assistant_text() {
+        let workspace = TestWorkspace::new();
+        let persistence_manager =
+            Arc::new(PersistenceManager::new(workspace.path_manager()).expect("persistence"));
+        let manager = test_manager(persistence_manager.clone());
+        let session = manager
+            .create_session(
+                "complete-fallback".to_string(),
+                "agentic".to_string(),
+                SessionConfig {
+                    workspace_path: Some(workspace.path().to_string_lossy().to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("session");
+        let turn_id = manager
+            .start_dialog_turn(
+                &session.session_id,
+                "agentic".to_string(),
+                "hello".to_string(),
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("turn");
+
+        manager
+            .complete_dialog_turn(
+                &session.session_id,
+                &turn_id,
+                "assistant reply".to_string(),
+                crate::agentic::core::TurnStats {
+                    total_rounds: 1,
+                    total_tools: 0,
+                    total_tokens: 0,
+                    duration_ms: 0,
+                },
+            )
+            .await
+            .expect("complete");
+
+        let reloaded = persistence_manager
+            .load_dialog_turn(workspace.path(), &session.session_id, 0)
+            .await
+            .expect("load")
+            .expect("turn exists");
+        let text: String = reloaded
+            .model_rounds
+            .iter()
+            .flat_map(|r| r.text_items.iter())
+            .map(|i| i.content.clone())
+            .collect();
+        assert_eq!(
+            text, "assistant reply",
+            "fallback must inject final_response as a text item"
+        );
+        assert_eq!(reloaded.status, TurnStatus::Completed);
     }
 
     #[test]
