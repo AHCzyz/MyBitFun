@@ -129,6 +129,7 @@ fn inject_partial_content_if_absent(
     text: &str,
     thinking: &str,
     ts: u64,
+    content_status: &str,
 ) {
     if text.trim().is_empty() && thinking.trim().is_empty() {
         return;
@@ -155,7 +156,7 @@ fn inject_partial_content_if_absent(
             is_subagent_item: None,
             parent_task_tool_id: None,
             subagent_session_id: None,
-            status: Some("completed".to_string()),
+            status: Some(content_status.to_string()),
         });
     }
     let mut thinking_items = Vec::new();
@@ -167,7 +168,7 @@ fn inject_partial_content_if_absent(
             is_collapsed: true,
             timestamp: ts,
             order_index: Some(0),
-            status: Some("completed".to_string()),
+            status: Some(content_status.to_string()),
             is_subagent_item: None,
             parent_task_tool_id: None,
             subagent_session_id: None,
@@ -193,7 +194,7 @@ fn inject_partial_content_if_absent(
         attempt_count: None,
         failure_category: None,
         token_details: None,
-        status: "completed".to_string(),
+        status: content_status.to_string(),
     });
 }
 
@@ -3164,6 +3165,7 @@ impl SessionManager {
             &final_response,
             thinking.as_deref().unwrap_or(""),
             completion_timestamp,
+            "completed",
         );
         turn.status = TurnStatus::Completed;
         turn.duration_ms = Some(stats.duration_ms);
@@ -3239,6 +3241,7 @@ impl SessionManager {
                 partial_text.as_deref().unwrap_or(""),
                 partial_thinking.as_deref().unwrap_or(""),
                 ts,
+                "error",
             );
         }
         turn.status = TurnStatus::Error;
@@ -3323,6 +3326,7 @@ impl SessionManager {
                 partial_text.as_deref().unwrap_or(""),
                 partial_thinking.as_deref().unwrap_or(""),
                 ts,
+                "cancelled",
             );
         }
         turn.status = TurnStatus::Cancelled;
@@ -4275,6 +4279,17 @@ mod tests {
         assert_eq!(text, "partial answer", "cancelled turn must persist partial text");
         assert_eq!(thinking, "partial reasoning", "cancelled turn must persist partial thinking");
         assert_eq!(reloaded.status, TurnStatus::Cancelled);
+        // review follow-up (problem 4): injected round/item status must reflect the
+        // turn outcome (cancelled), not hardcoded "completed".
+        let item_status = reloaded
+            .model_rounds
+            .iter()
+            .flat_map(|r| r.text_items.iter())
+            .find_map(|i| i.status.clone());
+        assert_eq!(item_status.as_deref(), Some("cancelled"),
+            "cancelled turn's injected text_item status must be \"cancelled\", not \"completed\"");
+        assert!(reloaded.model_rounds.iter().all(|r| r.status == "cancelled"),
+            "cancelled turn's injected round status must be \"cancelled\"");
     }
 
     #[tokio::test]
@@ -4384,6 +4399,16 @@ mod tests {
         assert_eq!(text, "partial before error");
         assert_eq!(thinking, "thinking before error");
         assert_eq!(reloaded.status, TurnStatus::Error);
+        // review follow-up (problem 4): injected status reflects the failure outcome.
+        let item_status = reloaded
+            .model_rounds
+            .iter()
+            .flat_map(|r| r.text_items.iter())
+            .find_map(|i| i.status.clone());
+        assert_eq!(item_status.as_deref(), Some("error"),
+            "failed turn's injected text_item status must be \"error\", not \"completed\"");
+        assert!(reloaded.model_rounds.iter().all(|r| r.status == "error"),
+            "failed turn's injected round status must be \"error\"");
     }
 
     #[test]

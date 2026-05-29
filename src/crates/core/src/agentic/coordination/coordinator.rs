@@ -355,7 +355,11 @@ async fn run_runtime_event_loop(
                                     &session_id, &turn_id, acc_text.clone(), Some(acc_thinking.clone()),
                                     TurnStats { total_rounds: 1, total_tools: 0, total_tokens: 0, duration_ms: 0 },
                                 ).await {
-                                    log::warn!("Runtime persist (completed) failed: turn_id={}, error={}", turn_id, e);
+                                    // review follow-up (problem 2): completed is the
+                                    // critical path — UI already showed the turn done with
+                                    // content, but persistence failed, so reload will lose
+                                    // it. error! (not warn!) so it surfaces in monitoring.
+                                    log::error!("Runtime persist (completed) failed: turn_id={}, error={}", turn_id, e);
                                 }
                                 "completed"
                             }
