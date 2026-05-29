@@ -125,6 +125,256 @@ impl Drop for TurnLifecycleGuard {
     }
 }
 
+/// RAII guard for a `runtime_turn_cancels` entry.
+///
+/// Entry-removal ownership crosses the `tokio::spawn` boundary because the
+/// entry is inserted on the calling thread *before* `create_session` (D4)
+/// to close the cold-start cancel window (F-1). Two regimes:
+///
+/// 1. **Calling-thread guard:** armed at construction; covers `?`
+///    early-returns of `registry.get` / `create_session`. `disarm()`ed
+///    immediately after a successful `tokio::spawn` — handing ownership to
+///    the spawn body's own guard. Mirrors `ActiveTurnRegistration`.
+///
+/// 2. **Spawn-body guard (inside the helper):** armed, never disarmed —
+///    sole remover on every helper exit path (D8 pre-prompt return,
+///    `prompt()` Err, cancel branch, stream-end, put-back, panic unwind).
+///
+/// `DashMap::remove` on a missing key is a no-op, so even a forgotten
+/// `disarm()` is harmless under double-remove.
+struct RuntimeCancelGuard {
+    map: Arc<DashMap<String, CancellationToken>>,
+    turn_id: String,
+    armed: bool,
+}
+
+impl RuntimeCancelGuard {
+    fn armed(map: Arc<DashMap<String, CancellationToken>>, turn_id: String) -> Self {
+        Self { map, turn_id, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for RuntimeCancelGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.map.remove(&self.turn_id);
+        }
+    }
+}
+
+/// Runtime (claude/OMP) spawn-task event loop, extracted from the inline
+/// closure body in `handle_user_input` for testability. The
+/// `RuntimeCancelGuard` constructed here is always armed and removes the
+/// `runtime_turn_cancels` entry on every exit path (panic-safe).
+#[allow(clippy::too_many_arguments)]
+async fn run_runtime_event_loop(
+    rt_session: Box<dyn AgentSession>,
+    user_input: String,
+    cancel_token: CancellationToken,
+    runtime_turn_cancels: Arc<DashMap<String, CancellationToken>>,
+    event_queue: Arc<EventQueue>,
+    session_slot: Arc<tokio::sync::Mutex<Option<Box<dyn AgentSession>>>>,
+    session_id: String,
+    turn_id: String,
+    runtime_id_for_log: String,
+) {
+    let _cancel_guard = RuntimeCancelGuard::armed(runtime_turn_cancels, turn_id.clone());
+
+    // D8 / F-2: a cancel may have fired during the cold-start
+    // create_session window. Check before prompt() so we neither run a
+    // zombie turn nor start (and bill) an Anthropic call.
+    if cancel_token.is_cancelled() {
+        log::info!(
+            "Runtime {} turn cancelled before prompt: session_id={}, turn_id={}",
+            runtime_id_for_log, session_id, turn_id,
+        );
+        let _ = event_queue.enqueue(
+            AgenticEvent::DialogTurnCancelled {
+                session_id: session_id.clone(),
+                turn_id: turn_id.clone(),
+            },
+            Some(EventPriority::High),
+        ).await;
+        let _ = rt_session.dispose().await;
+        return;
+    }
+
+    let mut stream = match rt_session.prompt(&user_input, vec![]).await {
+        Ok(s) => s,
+        Err(e) => {
+            let err_msg = e.to_string();
+            let category = classify_runtime_error(&err_msg, Some(&e.kind));
+            let detail = ai_error_detail_from_message(&err_msg, category.clone());
+            let _ = event_queue.enqueue(
+                AgenticEvent::DialogTurnFailed {
+                    session_id: session_id.clone(),
+                    turn_id: turn_id.clone(),
+                    error: err_msg,
+                    error_category: Some(category),
+                    error_detail: Some(detail),
+                },
+                Some(EventPriority::High),
+            ).await;
+            // Session may be in a bad state, dispose instead of caching.
+            let _ = rt_session.dispose().await;
+            return;
+        }
+    };
+
+    use futures::StreamExt;
+    loop {
+        tokio::select! {
+            biased;
+            _ = cancel_token.cancelled() => {
+                log::info!(
+                    "Runtime {} turn cancelled by user: session_id={}, turn_id={}",
+                    runtime_id_for_log, session_id, turn_id,
+                );
+                let _ = event_queue.enqueue(
+                    AgenticEvent::DialogTurnCancelled {
+                        session_id: session_id.clone(),
+                        turn_id: turn_id.clone(),
+                    },
+                    Some(EventPriority::High),  // F-7: match runtime Aborted arm
+                ).await;
+                let _ = rt_session.dispose().await;
+                return;
+            }
+            event = stream.next() => {
+                let Some(event) = event else { break };
+                match event {
+                    RuntimeEvent::TextDelta { delta, .. } => {
+                        let _ = event_queue.enqueue(
+                            AgenticEvent::TextChunk {
+                                session_id: session_id.clone(),
+                                turn_id: turn_id.clone(),
+                                round_id: turn_id.clone(),
+                                text: delta,
+                            },
+                            Some(EventPriority::Normal),
+                        ).await;
+                    }
+                    RuntimeEvent::ThinkingDelta { delta, .. } => {
+                        let _ = event_queue.enqueue(
+                            AgenticEvent::ThinkingChunk {
+                                session_id: session_id.clone(),
+                                turn_id: turn_id.clone(),
+                                round_id: turn_id.clone(),
+                                content: delta,
+                                is_end: false,
+                            },
+                            Some(EventPriority::Normal),
+                        ).await;
+                    }
+                    RuntimeEvent::ToolCallStart { tool_name, tool_call_id, .. } => {
+                        let _ = event_queue.enqueue(
+                            AgenticEvent::ToolEvent {
+                                session_id: session_id.clone(),
+                                turn_id: turn_id.clone(),
+                                round_id: turn_id.clone(),
+                                tool_event: bitfun_events::agentic::ToolEventData::Started {
+                                    tool_id: tool_call_id,
+                                    tool_name,
+                                    params: serde_json::Value::Null,
+                                    timeout_seconds: None,
+                                },
+                            },
+                            Some(EventPriority::Normal),
+                        ).await;
+                    }
+                    RuntimeEvent::TurnEnd { stop_reason, .. } => {
+                        let outcome = match stop_reason {
+                            bitfun_runtime_ports::agent_runtime::StopReason::Completed => {
+                                let _ = event_queue.enqueue(
+                                    AgenticEvent::DialogTurnCompleted {
+                                        session_id: session_id.clone(),
+                                        turn_id: turn_id.clone(),
+                                        total_rounds: 1,
+                                        total_tools: 0,
+                                        duration_ms: 0,
+                                        partial_recovery_reason: None,
+                                        success: Some(true),
+                                        finish_reason: None,
+                                    },
+                                    Some(EventPriority::High),
+                                ).await;
+                                "completed"
+                            }
+                            bitfun_runtime_ports::agent_runtime::StopReason::Aborted => {
+                                let _ = event_queue.enqueue(
+                                    AgenticEvent::DialogTurnCancelled {
+                                        session_id: session_id.clone(),
+                                        turn_id: turn_id.clone(),
+                                    },
+                                    Some(EventPriority::High),
+                                ).await;
+                                "aborted"
+                            }
+                            _ => {
+                                let err_msg = format!("Runtime turn ended: {:?}", stop_reason);
+                                let category = classify_runtime_error(&err_msg, None);
+                                let detail = ai_error_detail_from_message(&err_msg, category.clone());
+                                let _ = event_queue.enqueue(
+                                    AgenticEvent::DialogTurnFailed {
+                                        session_id: session_id.clone(),
+                                        turn_id: turn_id.clone(),
+                                        error: err_msg,
+                                        error_category: Some(category),
+                                        error_detail: Some(detail),
+                                    },
+                                    Some(EventPriority::High),
+                                ).await;
+                                "error"
+                            }
+                        };
+                        log::info!(
+                            "Runtime {} turn ended: session_id={}, turn_id={}, outcome={}",
+                            runtime_id_for_log, session_id, turn_id, outcome
+                        );
+                        break;
+                    }
+                    RuntimeEvent::Error { message, .. } => {
+                        let category = classify_runtime_error(&message, None);
+                        let detail = ai_error_detail_from_message(&message, category.clone());
+                        let _ = event_queue.enqueue(
+                            AgenticEvent::DialogTurnFailed {
+                                session_id: session_id.clone(),
+                                turn_id: turn_id.clone(),
+                                error: message,
+                                error_category: Some(category),
+                                error_detail: Some(detail),
+                            },
+                            Some(EventPriority::High),
+                        ).await;
+                        // Session may be in a bad state after a bridge error
+                        // (e.g. stuck in catch block, SDK retry state dirty).
+                        // Dispose instead of caching — matches prompt() Err.
+                        let _ = rt_session.dispose().await;
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    // Return the session to cache for reuse by the next turn.
+    // If a concurrent turn already raced ahead and stashed its own
+    // session here, replace() returns it so we can dispose it
+    // cleanly instead of dropping it on the floor (orphaning the
+    // bridge child process).
+    let mut slot_guard = session_slot.lock().await;
+    let displaced = slot_guard.replace(rt_session);
+    drop(slot_guard);
+    if let Some(prev_session) = displaced {
+        let _ = prev_session.dispose().await;
+    }
+    // _cancel_guard drops here: removes runtime_turn_cancels entry.
+}
+
 const MANUAL_COMPACTION_COMMAND: &str = "/compact";
 const CONTEXT_COMPRESSION_TOOL_NAME: &str = "ContextCompression";
 const DEFAULT_SUBAGENT_MAX_CONCURRENCY: usize = 5;
@@ -554,6 +804,13 @@ pub struct ConversationCoordinator {
     /// the inner Option is None while a turn is in-flight (taken out),
     /// Some when idle and ready for reuse.
     runtime_sessions: Arc<DashMap<String, Arc<tokio::sync::Mutex<Option<Box<dyn AgentSession>>>>>>,
+    /// Cancellation tokens for in-flight runtime (non-bitfun) turns. Keyed by
+    /// `turn_id` (per OpenSpec D1 — *not* `session_id`; per-session keying
+    /// would have a sticky-cancel bug since `CancellationToken::cancel()` is
+    /// permanent). Inserted on the calling thread before `create_session`
+    /// (D4 / F-1) so a cancel during the cold-start window is honoured.
+    /// Removed via `RuntimeCancelGuard::drop` (D3).
+    runtime_turn_cancels: Arc<DashMap<String, CancellationToken>>,
 }
 
 impl ConversationCoordinator {
@@ -1069,6 +1326,7 @@ Update the persona files and delete BOOTSTRAP.md as soon as bootstrap is complet
             round_injection_source: OnceLock::new(),
             active_turns_per_session: Arc::new(DashMap::new()),
             runtime_sessions: Arc::new(DashMap::new()),
+            runtime_turn_cancels: Arc::new(DashMap::new()),
         }
     }
 
@@ -2650,6 +2908,16 @@ Update the persona files and delete BOOTSTRAP.md as soon as bootstrap is complet
                 )
                 .await?;
 
+            // F-1 / D4: insert cancel_token before create_session (cold-start window).
+            // Calling-thread guard removes the orphaned entry on any `?`
+            // early-return below; disarmed after a successful tokio::spawn.
+            let cancel_token = CancellationToken::new();
+            self.runtime_turn_cancels.insert(turn_id.clone(), cancel_token.clone());
+            let mut cancel_entry_guard = RuntimeCancelGuard::armed(
+                self.runtime_turn_cancels.clone(),
+                turn_id.clone(),
+            );
+
             self.emit_event(AgenticEvent::DialogTurnStarted {
                 session_id: session_id.clone(),
                 turn_id: turn_id.clone(),
@@ -2700,172 +2968,37 @@ Update the persona files and delete BOOTSTRAP.md as soon as bootstrap is complet
             let turn_id_clone = turn_id.clone();
             let runtime_id_for_log = runtime_id.clone();
             let session_slot_clone = session_slot.clone();
+            let runtime_turn_cancels_for_task = self.runtime_turn_cancels.clone();
 
             tokio::spawn(async move {
                 // RAII guard: on any exit path (including panic unwind), decrement
                 // the in-flight counter and reset Processing → Idle if this turn
-                // still owns the session state. Replaces the manual fetch_sub +
-                // reset_session_state_if_processing triples that previously sat
-                // on each return path. See TurnLifecycleGuard at module top.
+                // still owns the session state. See TurnLifecycleGuard at module
+                // top. The runtime_turn_cancels entry is owned by an in-helper
+                // RuntimeCancelGuard (built inside run_runtime_event_loop).
                 let _guard = TurnLifecycleGuard::new(
-                    session_manager.clone(),
+                    session_manager,
                     session_id_clone.clone(),
                     turn_id_clone.clone(),
-                    active_counter.clone(),
+                    active_counter,
                 );
-
-                let mut stream = match rt_session.prompt(&wrapped_user_input, vec![]).await {
-                    Ok(s) => s,
-                    Err(e) => {
-                        let err_msg = e.to_string();
-                        let category = classify_runtime_error(&err_msg, Some(&e.kind));
-                        let detail = ai_error_detail_from_message(&err_msg, category.clone());
-                        let _ = event_queue.enqueue(
-                            AgenticEvent::DialogTurnFailed {
-                                session_id: session_id_clone.clone(),
-                                turn_id: turn_id_clone.clone(),
-                                error: err_msg,
-                                error_category: Some(category),
-                                error_detail: Some(detail),
-                            },
-                            Some(EventPriority::High),
-                        ).await;
-                        // Session may be in a bad state, dispose instead of caching.
-                        let _ = rt_session.dispose().await;
-                        return;
-                    }
-                };
-
-                use futures::StreamExt;
-                while let Some(event) = stream.next().await {
-                    match event {
-                        RuntimeEvent::TextDelta { delta, .. } => {
-                            let _ = event_queue.enqueue(
-                                AgenticEvent::TextChunk {
-                                    session_id: session_id_clone.clone(),
-                                    turn_id: turn_id_clone.clone(),
-                                    round_id: turn_id_clone.clone(),
-                                    text: delta,
-                                },
-                                Some(EventPriority::Normal),
-                            ).await;
-                        }
-                        RuntimeEvent::ThinkingDelta { delta, .. } => {
-                            let _ = event_queue.enqueue(
-                                AgenticEvent::ThinkingChunk {
-                                    session_id: session_id_clone.clone(),
-                                    turn_id: turn_id_clone.clone(),
-                                    round_id: turn_id_clone.clone(),
-                                    content: delta,
-                                    is_end: false,
-                                },
-                                Some(EventPriority::Normal),
-                            ).await;
-                        }
-                        RuntimeEvent::ToolCallStart { tool_name, tool_call_id, .. } => {
-                            let _ = event_queue.enqueue(
-                                AgenticEvent::ToolEvent {
-                                    session_id: session_id_clone.clone(),
-                                    turn_id: turn_id_clone.clone(),
-                                    round_id: turn_id_clone.clone(),
-                                    tool_event: bitfun_events::agentic::ToolEventData::Started {
-                                        tool_id: tool_call_id,
-                                        tool_name,
-                                        params: serde_json::Value::Null,
-                                        timeout_seconds: None,
-                                    },
-                                },
-                                Some(EventPriority::Normal),
-                            ).await;
-                        }
-                        RuntimeEvent::TurnEnd { stop_reason, .. } => {
-                            let outcome = match stop_reason {
-                                bitfun_runtime_ports::agent_runtime::StopReason::Completed => {
-                                    let _ = event_queue.enqueue(
-                                        AgenticEvent::DialogTurnCompleted {
-                                            session_id: session_id_clone.clone(),
-                                            turn_id: turn_id_clone.clone(),
-                                            total_rounds: 1,
-                                            total_tools: 0,
-                                            duration_ms: 0,
-                                            partial_recovery_reason: None,
-                                            success: Some(true),
-                                            finish_reason: None,
-                                        },
-                                        Some(EventPriority::High),
-                                    ).await;
-                                    "completed"
-                                }
-                                bitfun_runtime_ports::agent_runtime::StopReason::Aborted => {
-                                    let _ = event_queue.enqueue(
-                                        AgenticEvent::DialogTurnCancelled {
-                                            session_id: session_id_clone.clone(),
-                                            turn_id: turn_id_clone.clone(),
-                                        },
-                                        Some(EventPriority::High),
-                                    ).await;
-                                    "aborted"
-                                }
-                                _ => {
-                                    let err_msg = format!("Runtime turn ended: {:?}", stop_reason);
-                                    let category = classify_runtime_error(&err_msg, None);
-                                    let detail = ai_error_detail_from_message(&err_msg, category.clone());
-                                    let _ = event_queue.enqueue(
-                                        AgenticEvent::DialogTurnFailed {
-                                            session_id: session_id_clone.clone(),
-                                            turn_id: turn_id_clone.clone(),
-                                            error: err_msg,
-                                            error_category: Some(category),
-                                            error_detail: Some(detail),
-                                        },
-                                        Some(EventPriority::High),
-                                    ).await;
-                                    "error"
-                                }
-                            };
-                            log::info!(
-                                "Runtime {} turn ended: session_id={}, turn_id={}, outcome={}",
-                                runtime_id_for_log, session_id_clone, turn_id_clone, outcome
-                            );
-                            break;
-                        }
-                        RuntimeEvent::Error { message, .. } => {
-                            let category = classify_runtime_error(&message, None);
-                            let detail = ai_error_detail_from_message(&message, category.clone());
-                            let _ = event_queue.enqueue(
-                                AgenticEvent::DialogTurnFailed {
-                                    session_id: session_id_clone.clone(),
-                                    turn_id: turn_id_clone.clone(),
-                                    error: message,
-                                    error_category: Some(category),
-                                    error_detail: Some(detail),
-                                },
-                                Some(EventPriority::High),
-                            ).await;
-                            // Session may be in a bad state after a bridge error
-                            // (e.g. stuck in catch block, SDK retry state dirty).
-                            // Dispose instead of caching — matches prompt() Err.
-                            let _ = rt_session.dispose().await;
-                            return;
-                        }
-                        _ => {}
-                    }
-                }
-
-                // Return the session to cache for reuse by the next turn.
-                // If a concurrent turn already raced ahead and stashed its own
-                // session here, replace() returns it so we can dispose it
-                // cleanly instead of dropping it on the floor (orphaning the
-                // bridge child process).
-                let mut slot_guard = session_slot_clone.lock().await;
-                let displaced = slot_guard.replace(rt_session);
-                drop(slot_guard);
-                if let Some(prev_session) = displaced {
-                    let _ = prev_session.dispose().await;
-                }
-                // _guard drops here: counter -= 1 and reset Processing → Idle.
+                run_runtime_event_loop(
+                    rt_session,
+                    wrapped_user_input,
+                    cancel_token,
+                    runtime_turn_cancels_for_task,
+                    event_queue,
+                    session_slot_clone,
+                    session_id_clone,
+                    turn_id_clone,
+                    runtime_id_for_log,
+                ).await;
             });
 
+            // Spawn succeeded → spawn body's RuntimeCancelGuard now owns
+            // entry removal. Disarm the calling-thread guard so we don't
+            // double-remove (idempotent anyway via DashMap, but cleaner).
+            cancel_entry_guard.disarm();
             return Ok(());
         }
 
@@ -3359,6 +3492,21 @@ Update the persona files and delete BOOTSTRAP.md as soon as bootstrap is complet
 
         self.cancel_active_subagents_for_parent_turn(session_id, dialog_turn_id)
             .await;
+
+        // Step 3.5: signal runtime spawn task (no-op for bitfun turns).
+        // Clone-then-drop the DashMap Ref *before* calling cancel() (F-5):
+        // a future cancel() side-effect that re-enters the map would
+        // deadlock on the same thread otherwise. The token is an Arc
+        // internally; the clone is cheap. `get` not `remove` —
+        // `RuntimeCancelGuard::drop` owns removal so we don't race the
+        // spawn task removing it twice.
+        let runtime_cancel = self
+            .runtime_turn_cancels
+            .get(dialog_turn_id)
+            .map(|entry| entry.value().clone());
+        if let Some(token) = runtime_cancel {
+            token.cancel();
+        }
 
         // Step 4: Wait briefly for the spawn task that owns this turn to drain
         // its in-memory message writes before returning. Capped so the RPC
@@ -5727,4 +5875,196 @@ mod tests {
         assert_eq!(config.remote_ssh_host.as_deref(), Some("remote-host"));
         assert_eq!(config.model_id.as_deref(), Some("model-fast"));
     }
+
+    // -------- runtime event loop tests (review3 P-2) --------
+    use super::{run_runtime_event_loop, AgenticEvent, EventQueue, RuntimeEvent};
+    use crate::agentic::events::EventQueueConfig;
+    use bitfun_runtime_ports::agent_runtime::{AgentEventStream, AgentSession, StopReason};
+    use bitfun_runtime_ports::{AgentInputAttachment, PortResult};
+    use dashmap::DashMap;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::collections::HashMap;
+    use tokio::sync::mpsc;
+    use tokio_util::sync::CancellationToken;
+
+    struct FakeSession {
+        session_id: String,
+        event_rx: tokio::sync::Mutex<Option<mpsc::Receiver<RuntimeEvent>>>,
+        disposed: Arc<AtomicBool>,
+        prompt_called: Arc<AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl AgentSession for FakeSession {
+        fn session_id(&self) -> &str { &self.session_id }
+        async fn prompt(&self, _: &str, _: Vec<AgentInputAttachment>) -> PortResult<AgentEventStream> {
+            self.prompt_called.store(true, Ordering::SeqCst);
+            let rx = self.event_rx.lock().await.take().expect("prompt() called without pre-stocked receiver");
+            Ok(Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx)))
+        }
+        async fn abort(&self) -> PortResult<()> { Ok(()) }
+        async fn dispose(self: Box<Self>) -> PortResult<()> {
+            self.disposed.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    fn fake_session(
+        rx: Option<mpsc::Receiver<RuntimeEvent>>,
+        disposed: Arc<AtomicBool>,
+        prompt_called: Arc<AtomicBool>,
+    ) -> Box<dyn AgentSession> {
+        Box::new(FakeSession {
+            session_id: "fake-session".into(),
+            event_rx: tokio::sync::Mutex::new(rx),
+            disposed,
+            prompt_called,
+        })
+    }
+
+    #[tokio::test]
+    async fn runtime_event_loop_cancels_promptly() {
+        // F-6: keep tx alive so stream.next() stays pending; otherwise
+        // dropping tx makes ReceiverStream::next() return None and the
+        // helper exits via the put-back path — testing the wrong branch.
+        let (_tx, rx) = mpsc::channel::<RuntimeEvent>(8);
+        let disposed = Arc::new(AtomicBool::new(false));
+        let prompt_called = Arc::new(AtomicBool::new(false));
+        let session = fake_session(Some(rx), disposed.clone(), prompt_called.clone());
+
+        let cancel = CancellationToken::new();
+        let cancels: Arc<DashMap<String, CancellationToken>> = Arc::new(DashMap::new());
+        let queue = Arc::new(EventQueue::new(EventQueueConfig::default()));
+        let slot: Arc<tokio::sync::Mutex<Option<Box<dyn AgentSession>>>> =
+            Arc::new(tokio::sync::Mutex::new(None));
+
+        let task = tokio::spawn(run_runtime_event_loop(
+            session, "hi".into(), cancel.clone(), cancels.clone(),
+            queue.clone(), slot.clone(),
+            "sid".into(), "tid".into(), "claude".into(),
+        ));
+
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        cancel.cancel();
+        let outcome = tokio::time::timeout(std::time::Duration::from_millis(200), task).await;
+        assert!(outcome.is_ok(), "helper did not exit within 200ms after cancel");
+
+        assert!(disposed.load(Ordering::SeqCst), "session was not disposed");
+        assert!(prompt_called.load(Ordering::SeqCst),
+            "prompt was not reached (T1 exercises post-prompt cancel)");
+        assert!(slot.lock().await.is_none(), "session was put back on cancel path");
+
+        let batch = queue.dequeue_batch(8).await;
+        assert!(
+            batch.iter().any(|env| matches!(env.event, AgenticEvent::DialogTurnCancelled { .. })),
+            "DialogTurnCancelled was not emitted"
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_event_loop_completes_cleanly() {
+        let (tx, rx) = mpsc::channel::<RuntimeEvent>(8);
+        tx.send(RuntimeEvent::TurnEnd {
+            stop_reason: StopReason::Completed,
+            metadata: HashMap::new(),
+        }).await.unwrap();
+        drop(tx);
+
+        let disposed = Arc::new(AtomicBool::new(false));
+        let prompt_called = Arc::new(AtomicBool::new(false));
+        let session = fake_session(Some(rx), disposed.clone(), prompt_called.clone());
+
+        let cancel = CancellationToken::new();
+        let cancels: Arc<DashMap<String, CancellationToken>> = Arc::new(DashMap::new());
+        let queue = Arc::new(EventQueue::new(EventQueueConfig::default()));
+        let slot: Arc<tokio::sync::Mutex<Option<Box<dyn AgentSession>>>> =
+            Arc::new(tokio::sync::Mutex::new(None));
+
+        run_runtime_event_loop(
+            session, "hi".into(), cancel, cancels,
+            queue.clone(), slot.clone(),
+            "sid".into(), "tid".into(), "claude".into(),
+        ).await;
+
+        assert!(!disposed.load(Ordering::SeqCst), "happy path disposed (should not)");
+        assert!(slot.lock().await.is_some(), "happy path did not put back");
+
+        let batch = queue.dequeue_batch(8).await;
+        assert!(
+            batch.iter().any(|env| matches!(env.event, AgenticEvent::DialogTurnCompleted { .. })),
+            "DialogTurnCompleted was not emitted"
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_event_loop_disposes_on_error_event() {
+        let (tx, rx) = mpsc::channel::<RuntimeEvent>(8);
+        tx.send(RuntimeEvent::Error {
+            message: "rate limit".into(),
+            metadata: HashMap::new(),
+        }).await.unwrap();
+        drop(tx);
+
+        let disposed = Arc::new(AtomicBool::new(false));
+        let prompt_called = Arc::new(AtomicBool::new(false));
+        let session = fake_session(Some(rx), disposed.clone(), prompt_called.clone());
+
+        let cancel = CancellationToken::new();
+        let cancels: Arc<DashMap<String, CancellationToken>> = Arc::new(DashMap::new());
+        let queue = Arc::new(EventQueue::new(EventQueueConfig::default()));
+        let slot: Arc<tokio::sync::Mutex<Option<Box<dyn AgentSession>>>> =
+            Arc::new(tokio::sync::Mutex::new(None));
+
+        run_runtime_event_loop(
+            session, "hi".into(), cancel, cancels,
+            queue.clone(), slot.clone(),
+            "sid".into(), "tid".into(), "claude".into(),
+        ).await;
+
+        assert!(disposed.load(Ordering::SeqCst),
+            "Error event did not dispose (review3 batch1 P-5 regression)");
+        assert!(slot.lock().await.is_none(), "Error path put session back");
+
+        let batch = queue.dequeue_batch(8).await;
+        assert!(
+            batch.iter().any(|env| matches!(env.event, AgenticEvent::DialogTurnFailed { .. })),
+            "DialogTurnFailed was not emitted"
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_event_loop_skips_prompt_when_precancelled() {
+        // D8 / F-2: cancel fires during the cold-start create_session window.
+        // Helper must short-circuit before prompt() — no Anthropic API call.
+        let (_tx, rx) = mpsc::channel::<RuntimeEvent>(8);
+        let disposed = Arc::new(AtomicBool::new(false));
+        let prompt_called = Arc::new(AtomicBool::new(false));
+        let session = fake_session(Some(rx), disposed.clone(), prompt_called.clone());
+
+        let cancel = CancellationToken::new();
+        cancel.cancel();  // BEFORE running helper
+        let cancels: Arc<DashMap<String, CancellationToken>> = Arc::new(DashMap::new());
+        let queue = Arc::new(EventQueue::new(EventQueueConfig::default()));
+        let slot: Arc<tokio::sync::Mutex<Option<Box<dyn AgentSession>>>> =
+            Arc::new(tokio::sync::Mutex::new(None));
+
+        run_runtime_event_loop(
+            session, "hi".into(), cancel, cancels,
+            queue.clone(), slot.clone(),
+            "sid".into(), "tid".into(), "claude".into(),
+        ).await;
+
+        assert!(!prompt_called.load(Ordering::SeqCst),
+            "D8 short-circuit failed — prompt was called despite pre-cancel");
+        assert!(disposed.load(Ordering::SeqCst), "pre-prompt branch did not dispose");
+        assert!(slot.lock().await.is_none(), "pre-prompt branch put session back");
+
+        let batch = queue.dequeue_batch(8).await;
+        assert!(
+            batch.iter().any(|env| matches!(env.event, AgenticEvent::DialogTurnCancelled { .. })),
+            "DialogTurnCancelled was not emitted"
+        );
+    }
+
 }
