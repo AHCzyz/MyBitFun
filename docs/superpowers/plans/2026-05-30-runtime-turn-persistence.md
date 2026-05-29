@@ -2,6 +2,7 @@
 change: runtime-turn-persistence
 design-doc: docs/superpowers/specs/2026-05-30-runtime-turn-persistence-design.md
 base-ref: 70ee5ca0d99bf5863c9dbdbd6acb8f3f78baf1e5
+archived-with: 2026-05-30-runtime-turn-persistence
 ---
 
 # Runtime Turn Persistence (F-3) Implementation Plan

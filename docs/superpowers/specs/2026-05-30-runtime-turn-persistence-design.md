@@ -2,6 +2,8 @@
 comet_change: runtime-turn-persistence
 role: technical-design
 canonical_spec: openspec
+archived-with: 2026-05-30-runtime-turn-persistence
+status: final
 ---
 
 # Runtime Turn Persistence — 技术设计
