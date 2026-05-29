@@ -1,16 +1,18 @@
 workflow: full
-phase: build
-build_mode: null
-isolation: null
-verify_mode: null
+phase: verify
+build_mode: executing-plans
+isolation: branch
+verify_mode: full
 base_ref: 8d8f22b57a4b98092c7044e6481a9996db52bcec
 design_doc: docs/superpowers/specs/2026-05-30-runtime-turn-persistence-design.md
 plan: docs/superpowers/plans/2026-05-30-runtime-turn-persistence.md
 verify_result: pending
-verification_report: null
+verification_report: docs/superpowers/reports/2026-05-30-runtime-turn-persistence-verify.md
 branch_status: pending
 created_at: 2026-05-30
 verified_at: null
 archived: false
 handoff_context: openspec/changes/runtime-turn-persistence/.comet/handoff/design-context.json
 handoff_hash: 904dd26254359952fa1712b97046c23d0fb24b71318f15efd7dc1b3eff4c0965
+build_command: cargo check -p bitfun-core --tests
+verify_command: cargo test -p bitfun-core --lib coordinator::tests
