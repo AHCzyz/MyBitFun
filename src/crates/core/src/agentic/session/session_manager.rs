@@ -3120,6 +3120,7 @@ impl SessionManager {
         session_id: &str,
         turn_id: &str,
         final_response: String,
+        thinking: Option<String>,
         stats: TurnStats,
     ) -> BitFunResult<()> {
         if !self.should_persist_session_id(session_id) {
@@ -3158,7 +3159,12 @@ impl SessionManager {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
-        inject_partial_content_if_absent(&mut turn, &final_response, "", completion_timestamp);
+        inject_partial_content_if_absent(
+            &mut turn,
+            &final_response,
+            thinking.as_deref().unwrap_or(""),
+            completion_timestamp,
+        );
         turn.status = TurnStatus::Completed;
         turn.duration_ms = Some(stats.duration_ms);
         turn.end_time = Some(completion_timestamp);
@@ -3192,6 +3198,8 @@ impl SessionManager {
         session_id: &str,
         turn_id: &str,
         error: String,
+        partial_text: Option<String>,
+        partial_thinking: Option<String>,
     ) -> BitFunResult<()> {
         if !self.should_persist_session_id(session_id) {
             debug!(
@@ -3221,6 +3229,18 @@ impl SessionManager {
             .await?
             .ok_or_else(|| BitFunError::NotFound(format!("Dialog turn not found: {}", turn_id)))?;
 
+        if partial_text.is_some() || partial_thinking.is_some() {
+            let ts = SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            inject_partial_content_if_absent(
+                &mut turn,
+                partial_text.as_deref().unwrap_or(""),
+                partial_thinking.as_deref().unwrap_or(""),
+                ts,
+            );
+        }
         turn.status = TurnStatus::Error;
         turn.end_time = Some(
             SystemTime::now()
@@ -3254,7 +3274,13 @@ impl SessionManager {
     /// frontend / persistence layer can distinguish a user-cancelled turn
     /// from a fully-completed one. Any partial assistant content that was
     /// already streamed is preserved in `model_rounds`.
-    pub async fn cancel_dialog_turn(&self, session_id: &str, turn_id: &str) -> BitFunResult<()> {
+    pub async fn cancel_dialog_turn(
+        &self,
+        session_id: &str,
+        turn_id: &str,
+        partial_text: Option<String>,
+        partial_thinking: Option<String>,
+    ) -> BitFunResult<()> {
         if !self.should_persist_session_id(session_id) {
             debug!(
                 "Skipping dialog turn persistence for transient session cancellation: session_id={}, turn_id={}",
@@ -3283,6 +3309,18 @@ impl SessionManager {
             .await?
             .ok_or_else(|| BitFunError::NotFound(format!("Dialog turn not found: {}", turn_id)))?;
 
+        if partial_text.is_some() || partial_thinking.is_some() {
+            let ts = SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            inject_partial_content_if_absent(
+                &mut turn,
+                partial_text.as_deref().unwrap_or(""),
+                partial_thinking.as_deref().unwrap_or(""),
+                ts,
+            );
+        }
         turn.status = TurnStatus::Cancelled;
         turn.end_time = Some(
             SystemTime::now()
@@ -4146,6 +4184,7 @@ mod tests {
                 &session.session_id,
                 &turn_id,
                 "assistant reply".to_string(),
+                None,
                 crate::agentic::core::TurnStats {
                     total_rounds: 1,
                     total_tools: 0,
@@ -4172,6 +4211,175 @@ mod tests {
             "fallback must inject final_response as a text item"
         );
         assert_eq!(reloaded.status, TurnStatus::Completed);
+    }
+
+    #[tokio::test]
+    async fn cancel_dialog_turn_persists_partial_text_and_thinking() {
+        let workspace = TestWorkspace::new();
+        let pm = Arc::new(PersistenceManager::new(workspace.path_manager()).expect("pm"));
+        let manager = test_manager(pm.clone());
+        let session = manager
+            .create_session(
+                "cancel-partial".to_string(),
+                "agentic".to_string(),
+                SessionConfig {
+                    workspace_path: Some(workspace.path().to_string_lossy().to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("session");
+        let turn_id = manager
+            .start_dialog_turn(
+                &session.session_id,
+                "agentic".to_string(),
+                "q".to_string(),
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("turn");
+
+        manager
+            .cancel_dialog_turn(
+                &session.session_id,
+                &turn_id,
+                Some("partial answer".to_string()),
+                Some("partial reasoning".to_string()),
+            )
+            .await
+            .expect("cancel");
+
+        let reloaded = pm
+            .load_dialog_turn(workspace.path(), &session.session_id, 0)
+            .await
+            .expect("load")
+            .expect("exists");
+        let text: String = reloaded
+            .model_rounds
+            .iter()
+            .flat_map(|r| r.text_items.iter())
+            .map(|i| i.content.clone())
+            .collect();
+        let thinking: String = reloaded
+            .model_rounds
+            .iter()
+            .flat_map(|r| r.thinking_items.iter())
+            .map(|i| i.content.clone())
+            .collect();
+        assert_eq!(text, "partial answer", "cancelled turn must persist partial text");
+        assert_eq!(thinking, "partial reasoning", "cancelled turn must persist partial thinking");
+        assert_eq!(reloaded.status, TurnStatus::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn cancel_dialog_turn_with_none_injects_no_round() {
+        let workspace = TestWorkspace::new();
+        let pm = Arc::new(PersistenceManager::new(workspace.path_manager()).expect("pm"));
+        let manager = test_manager(pm.clone());
+        let session = manager
+            .create_session(
+                "cancel-none".to_string(),
+                "agentic".to_string(),
+                SessionConfig {
+                    workspace_path: Some(workspace.path().to_string_lossy().to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("session");
+        let turn_id = manager
+            .start_dialog_turn(
+                &session.session_id,
+                "agentic".to_string(),
+                "q".to_string(),
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("turn");
+
+        manager
+            .cancel_dialog_turn(&session.session_id, &turn_id, None, None)
+            .await
+            .expect("cancel");
+
+        let reloaded = pm
+            .load_dialog_turn(workspace.path(), &session.session_id, 0)
+            .await
+            .expect("load")
+            .expect("exists");
+        assert!(
+            reloaded
+                .model_rounds
+                .iter()
+                .all(|r| r.text_items.is_empty() && r.thinking_items.is_empty()),
+            "None partial content must not inject a round (bitfun no-op)"
+        );
+        assert_eq!(reloaded.status, TurnStatus::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn fail_dialog_turn_persists_partial_text_and_thinking() {
+        let workspace = TestWorkspace::new();
+        let pm = Arc::new(PersistenceManager::new(workspace.path_manager()).expect("pm"));
+        let manager = test_manager(pm.clone());
+        let session = manager
+            .create_session(
+                "fail-partial".to_string(),
+                "agentic".to_string(),
+                SessionConfig {
+                    workspace_path: Some(workspace.path().to_string_lossy().to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("session");
+        let turn_id = manager
+            .start_dialog_turn(
+                &session.session_id,
+                "agentic".to_string(),
+                "q".to_string(),
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("turn");
+
+        manager
+            .fail_dialog_turn(
+                &session.session_id,
+                &turn_id,
+                "boom".to_string(),
+                Some("partial before error".to_string()),
+                Some("thinking before error".to_string()),
+            )
+            .await
+            .expect("fail");
+
+        let reloaded = pm
+            .load_dialog_turn(workspace.path(), &session.session_id, 0)
+            .await
+            .expect("load")
+            .expect("exists");
+        let text: String = reloaded
+            .model_rounds
+            .iter()
+            .flat_map(|r| r.text_items.iter())
+            .map(|i| i.content.clone())
+            .collect();
+        let thinking: String = reloaded
+            .model_rounds
+            .iter()
+            .flat_map(|r| r.thinking_items.iter())
+            .map(|i| i.content.clone())
+            .collect();
+        assert_eq!(text, "partial before error");
+        assert_eq!(thinking, "thinking before error");
+        assert_eq!(reloaded.status, TurnStatus::Error);
     }
 
     #[test]

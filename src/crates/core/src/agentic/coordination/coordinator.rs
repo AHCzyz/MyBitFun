@@ -1756,6 +1756,7 @@ Update the persona files and delete BOOTSTRAP.md as soon as bootstrap is complet
                 session_id,
                 turn_id,
                 final_response.clone(),
+                None, // bitfun path: thinking persisted via execution engine, not here
                 TurnStats {
                     total_rounds: execution_result.total_rounds,
                     total_tools: 0, // TODO: get from execution_result
@@ -1843,7 +1844,7 @@ Update the persona files and delete BOOTSTRAP.md as soon as bootstrap is complet
         }
 
         if let Err(error) = session_manager
-            .cancel_dialog_turn(session_id, turn_id)
+            .cancel_dialog_turn(session_id, turn_id, None, None)
             .await
         {
             error!(
@@ -1921,7 +1922,7 @@ Update the persona files and delete BOOTSTRAP.md as soon as bootstrap is complet
         }
 
         if let Err(persist_error) = session_manager
-            .fail_dialog_turn(session_id, turn_id, error_text.clone())
+            .fail_dialog_turn(session_id, turn_id, error_text.clone(), None, None)
             .await
         {
             error!(
