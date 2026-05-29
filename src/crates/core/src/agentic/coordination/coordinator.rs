@@ -209,9 +209,12 @@ async fn run_runtime_event_loop(
             // review4 B: cancel may have fired between D8 is_cancelled() check and prompt() Err.
             // Recheck to classify as Cancelled rather than Failed.
             if cancel_token.is_cancelled() {
+                // review4-ab-followup-gaps (1): preserve the suppressed PortError
+                // for post-mortem. We classify the event as Cancelled (UX), but the
+                // underlying prompt() failure must remain greppable in logs.
                 log::info!(
-                    "Runtime {} turn cancelled during prompt(): session_id={}, turn_id={}",
-                    runtime_id_for_log, session_id, turn_id,
+                    "Runtime {} turn cancelled during prompt(): session_id={}, turn_id={}, suppressed_err={:?}, suppressed_kind={:?}",
+                    runtime_id_for_log, session_id, turn_id, e, e.kind,
                 );
                 let _ = event_queue.enqueue(
                     AgenticEvent::DialogTurnCancelled {
@@ -332,6 +335,28 @@ async fn run_runtime_event_loop(
                                 "aborted"
                             }
                             _ => {
+                                // review4-ab-followup-gaps (4): mirror prompt() Err
+                                // recheck. A non-Completed/Aborted stop racing a user
+                                // cancel should classify as Cancelled, not Failed.
+                                // Unlike the normal TurnEnd path (which `break`s and
+                                // caches the session), a cancelled bad-state turn must
+                                // dispose + return — matching the Error / prompt() Err
+                                // arms (do not recycle a session of a cancelled turn).
+                                if cancel_token.is_cancelled() {
+                                    log::info!(
+                                        "Runtime {} turn cancelled at stop_reason={:?}: session_id={}, turn_id={}",
+                                        runtime_id_for_log, stop_reason, session_id, turn_id,
+                                    );
+                                    let _ = event_queue.enqueue(
+                                        AgenticEvent::DialogTurnCancelled {
+                                            session_id: session_id.clone(),
+                                            turn_id: turn_id.clone(),
+                                        },
+                                        Some(EventPriority::High),
+                                    ).await;
+                                    let _ = rt_session.dispose().await;
+                                    return;
+                                }
                                 let err_msg = format!("Runtime turn ended: {:?}", stop_reason);
                                 let category = classify_runtime_error(&err_msg, None);
                                 let detail = ai_error_detail_from_message(&err_msg, category.clone());
@@ -355,6 +380,28 @@ async fn run_runtime_event_loop(
                         break;
                     }
                     RuntimeEvent::Error { message, .. } => {
+                        // review4-ab-followup-gaps (4): mirror prompt() Err recheck
+                        // (review4 B). A cancel that races a runtime stream Error
+                        // should classify as user-cancel, not Failed. Defense-in-depth:
+                        // the biased select cancel arm normally wins once the token is
+                        // set, but this closes the window where the Error event was
+                        // already dequeued before cancel fired (and guards a future
+                        // removal of `biased`).
+                        if cancel_token.is_cancelled() {
+                            log::info!(
+                                "Runtime {} turn cancelled during stream error: session_id={}, turn_id={}, suppressed_msg={:?}",
+                                runtime_id_for_log, session_id, turn_id, message,
+                            );
+                            let _ = event_queue.enqueue(
+                                AgenticEvent::DialogTurnCancelled {
+                                    session_id: session_id.clone(),
+                                    turn_id: turn_id.clone(),
+                                },
+                                Some(EventPriority::High),
+                            ).await;
+                            let _ = rt_session.dispose().await;
+                            return;
+                        }
                         let category = classify_runtime_error(&message, None);
                         let detail = ai_error_detail_from_message(&message, category.clone());
                         let _ = event_queue.enqueue(
@@ -5897,7 +5944,7 @@ mod tests {
     use super::{run_runtime_event_loop, AgenticEvent, EventQueue, RuntimeEvent};
     use crate::agentic::events::EventQueueConfig;
     use bitfun_runtime_ports::agent_runtime::{AgentEventStream, AgentSession, StopReason};
-    use bitfun_runtime_ports::{AgentInputAttachment, PortResult};
+    use bitfun_runtime_ports::{AgentInputAttachment, PortError, PortErrorKind, PortResult};
     use dashmap::DashMap;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
@@ -5934,6 +5981,13 @@ mod tests {
         event_rx: tokio::sync::Mutex<Option<mpsc::Receiver<RuntimeEvent>>>,
         disposed: Arc<AtomicBool>,
         prompt_called: Arc<AtomicBool>,
+        // review4-ab-followup-gaps (2): inject a prompt() failure so the
+        // prompt() Err arm (review4 B recheck) becomes reachable in tests.
+        prompt_err: tokio::sync::Mutex<Option<PortError>>,
+        // When set, prompt() cancels this token *before* returning Err — this
+        // reproduces "cancel fired after D8 passed, before prompt() returned"
+        // (the exact window review4 B's recheck guards).
+        cancel_on_prompt: Option<CancellationToken>,
     }
 
     #[async_trait::async_trait]
@@ -5941,6 +5995,16 @@ mod tests {
         fn session_id(&self) -> &str { &self.session_id }
         async fn prompt(&self, _: &str, _: Vec<AgentInputAttachment>) -> PortResult<AgentEventStream> {
             self.prompt_called.store(true, Ordering::SeqCst);
+            // Fire the injected cancel (if any) inside prompt() — reproduces a
+            // cancel that races prompt() completion. D8 has already passed at
+            // this point, so this exercises the post-D8 windows: the prompt()
+            // Err recheck (T5) and the loop-entry-with-cancel-set path (T7).
+            if let Some(token) = &self.cancel_on_prompt {
+                token.cancel();
+            }
+            if let Some(err) = self.prompt_err.lock().await.take() {
+                return Err(err);
+            }
             let rx = self.event_rx.lock().await.take().expect("prompt() called without pre-stocked receiver");
             Ok(Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx)))
         }
@@ -5961,6 +6025,28 @@ mod tests {
             event_rx: tokio::sync::Mutex::new(rx),
             disposed,
             prompt_called,
+            prompt_err: tokio::sync::Mutex::new(None),
+            cancel_on_prompt: None,
+        })
+    }
+
+    /// review4-ab-followup-gaps (2): build a FakeSession whose prompt() returns
+    /// `err`. If `cancel_on_prompt` is Some, prompt() cancels it before returning
+    /// Err (T5: classify as Cancelled); if None, prompt() just returns Err
+    /// (T6: classify as Failed).
+    fn fake_session_with_prompt_err(
+        err: PortError,
+        disposed: Arc<AtomicBool>,
+        prompt_called: Arc<AtomicBool>,
+        cancel_on_prompt: Option<CancellationToken>,
+    ) -> Box<dyn AgentSession> {
+        Box::new(FakeSession {
+            session_id: "fake-session".into(),
+            event_rx: tokio::sync::Mutex::new(None),
+            disposed,
+            prompt_called,
+            prompt_err: tokio::sync::Mutex::new(Some(err)),
+            cancel_on_prompt,
         })
     }
 
@@ -6020,12 +6106,13 @@ mod tests {
 
         let cancel = CancellationToken::new();
         let cancels: Arc<DashMap<String, CancellationToken>> = Arc::new(DashMap::new());
+        cancels.insert("tid".into(), cancel.clone()); // review4-ab-followup-gaps (3): verify guard removal on happy path
         let queue = Arc::new(EventQueue::new(EventQueueConfig::default()));
         let slot: Arc<tokio::sync::Mutex<Option<Box<dyn AgentSession>>>> =
             Arc::new(tokio::sync::Mutex::new(None));
 
         run_runtime_event_loop(
-            session, "hi".into(), cancel, cancels,
+            session, "hi".into(), cancel, cancels.clone(),
             queue.clone(), slot.clone(),
             "sid".into(), "tid".into(), "claude".into(),
         ).await;
@@ -6038,6 +6125,7 @@ mod tests {
             batch.iter().any(|env| matches!(env.event, AgenticEvent::DialogTurnCompleted { .. })),
             "DialogTurnCompleted was not emitted"
         );
+        assert!(cancels.get("tid").is_none(), "cancel guard did not remove entry after happy path");
     }
 
     #[tokio::test]
@@ -6055,12 +6143,13 @@ mod tests {
 
         let cancel = CancellationToken::new();
         let cancels: Arc<DashMap<String, CancellationToken>> = Arc::new(DashMap::new());
+        cancels.insert("tid".into(), cancel.clone()); // review4-ab-followup-gaps (3): verify guard removal on error path
         let queue = Arc::new(EventQueue::new(EventQueueConfig::default()));
         let slot: Arc<tokio::sync::Mutex<Option<Box<dyn AgentSession>>>> =
             Arc::new(tokio::sync::Mutex::new(None));
 
         run_runtime_event_loop(
-            session, "hi".into(), cancel, cancels,
+            session, "hi".into(), cancel, cancels.clone(),
             queue.clone(), slot.clone(),
             "sid".into(), "tid".into(), "claude".into(),
         ).await;
@@ -6074,6 +6163,7 @@ mod tests {
             batch.iter().any(|env| matches!(env.event, AgenticEvent::DialogTurnFailed { .. })),
             "DialogTurnFailed was not emitted"
         );
+        assert!(cancels.get("tid").is_none(), "cancel guard did not remove entry after error path");
     }
 
     #[tokio::test]
@@ -6110,6 +6200,159 @@ mod tests {
             "DialogTurnCancelled was not emitted"
         );
         assert!(cancels.get("tid").is_none(), "cancel guard did not remove entry after pre-cancel path");
+    }
+
+    // -------- prompt() Err recheck tests (review4-ab-followup-gaps 2) --------
+
+    #[tokio::test]
+    async fn runtime_event_loop_classifies_prompt_err_as_cancelled_when_cancel_signaled() {
+        // review4 B / gap (1)(2): D8 passes (token not yet set), then prompt()
+        // fires the cancel and returns Err. The post-prompt recheck must
+        // classify this as Cancelled (not Failed) and dispose the session.
+        let disposed = Arc::new(AtomicBool::new(false));
+        let prompt_called = Arc::new(AtomicBool::new(false));
+        let cancel = CancellationToken::new();
+        // NOTE: not pre-cancelled — D8 must pass so we reach prompt(). The
+        // FakeSession cancels the token *inside* prompt(), reproducing the
+        // exact window review4 B guards.
+        let session = fake_session_with_prompt_err(
+            PortError::new(PortErrorKind::Backend, "boom"),
+            disposed.clone(),
+            prompt_called.clone(),
+            Some(cancel.clone()),
+        );
+
+        let cancels: Arc<DashMap<String, CancellationToken>> = Arc::new(DashMap::new());
+        cancels.insert("tid".into(), cancel.clone());
+        let queue = Arc::new(EventQueue::new(EventQueueConfig::default()));
+        let slot: Arc<tokio::sync::Mutex<Option<Box<dyn AgentSession>>>> =
+            Arc::new(tokio::sync::Mutex::new(None));
+
+        run_runtime_event_loop(
+            session, "hi".into(), cancel, cancels.clone(),
+            queue.clone(), slot.clone(),
+            "sid".into(), "tid".into(), "claude".into(),
+        ).await;
+
+        assert!(prompt_called.load(Ordering::SeqCst), "prompt() was not reached");
+        assert!(disposed.load(Ordering::SeqCst), "prompt() Err cancel path did not dispose");
+        assert!(slot.lock().await.is_none(), "prompt() Err path put session back");
+
+        let batch = queue.dequeue_batch(8).await;
+        assert!(
+            batch.iter().any(|env| matches!(env.event, AgenticEvent::DialogTurnCancelled { .. })),
+            "DialogTurnCancelled was not emitted"
+        );
+        assert!(
+            !batch.iter().any(|env| matches!(env.event, AgenticEvent::DialogTurnFailed { .. })),
+            "must NOT emit Failed when cancel raced prompt() Err"
+        );
+        assert!(cancels.get("tid").is_none(), "cancel guard did not remove entry after prompt() Err cancel path");
+    }
+
+    #[tokio::test]
+    async fn runtime_event_loop_prompt_err_emits_failed_when_not_cancelled() {
+        // gap (2) negative case: prompt() returns Err with NO cancel. The
+        // recheck must fall through to the Failed classification. Guards
+        // against an inverted `is_cancelled()` condition.
+        let disposed = Arc::new(AtomicBool::new(false));
+        let prompt_called = Arc::new(AtomicBool::new(false));
+        let session = fake_session_with_prompt_err(
+            PortError::new(PortErrorKind::Backend, "boom"),
+            disposed.clone(),
+            prompt_called.clone(),
+            None, // no cancel
+        );
+
+        let cancel = CancellationToken::new();
+        let cancels: Arc<DashMap<String, CancellationToken>> = Arc::new(DashMap::new());
+        cancels.insert("tid".into(), cancel.clone());
+        let queue = Arc::new(EventQueue::new(EventQueueConfig::default()));
+        let slot: Arc<tokio::sync::Mutex<Option<Box<dyn AgentSession>>>> =
+            Arc::new(tokio::sync::Mutex::new(None));
+
+        run_runtime_event_loop(
+            session, "hi".into(), cancel, cancels.clone(),
+            queue.clone(), slot.clone(),
+            "sid".into(), "tid".into(), "claude".into(),
+        ).await;
+
+        assert!(prompt_called.load(Ordering::SeqCst), "prompt() was not reached");
+        assert!(disposed.load(Ordering::SeqCst), "prompt() Err path did not dispose");
+        assert!(slot.lock().await.is_none(), "prompt() Err path put session back");
+
+        let batch = queue.dequeue_batch(8).await;
+        assert!(
+            batch.iter().any(|env| matches!(env.event, AgenticEvent::DialogTurnFailed { .. })),
+            "DialogTurnFailed was not emitted on uncancelled prompt() Err"
+        );
+        assert!(
+            !batch.iter().any(|env| matches!(env.event, AgenticEvent::DialogTurnCancelled { .. })),
+            "must NOT emit Cancelled when not cancelled"
+        );
+        assert!(cancels.get("tid").is_none(), "cancel guard did not remove entry after prompt() Err path");
+    }
+
+    #[tokio::test]
+    async fn runtime_event_loop_classifies_stream_error_as_cancelled_when_cancelled() {
+        // gap (4) invariant guard: a cancel that is set when a stream Error
+        // event is ready must yield a Cancelled terminal — NEVER Failed.
+        //
+        // With the biased select, the cancel arm wins before stream.next() is
+        // polled, so this routes through the loop cancel arm (the Error-arm
+        // recheck is defense-in-depth for a future removal of `biased` and is
+        // not deterministically reachable in a single-threaded test). The
+        // assertion holds for both routes; it fails only if BOTH `biased` and
+        // the Error-arm recheck were removed.
+        let (tx, rx) = mpsc::channel::<RuntimeEvent>(8);
+        tx.send(RuntimeEvent::Error {
+            message: "bridge crashed".into(),
+            metadata: HashMap::new(),
+        }).await.unwrap();
+        // keep tx alive: if the cancel arm somehow didn't win, the Error event
+        // is ready to be read and the Error-arm recheck would still apply.
+
+        let disposed = Arc::new(AtomicBool::new(false));
+        let prompt_called = Arc::new(AtomicBool::new(false));
+        let cancel = CancellationToken::new();
+        // Build FakeSession directly: prompt() returns Ok(stream) AND fires the
+        // cancel — so the helper enters the loop with the token already set
+        // while a Failed-producing Error event sits ready in the stream.
+        let session: Box<dyn AgentSession> = Box::new(FakeSession {
+            session_id: "fake-session".into(),
+            event_rx: tokio::sync::Mutex::new(Some(rx)),
+            disposed: disposed.clone(),
+            prompt_called: prompt_called.clone(),
+            prompt_err: tokio::sync::Mutex::new(None),
+            cancel_on_prompt: Some(cancel.clone()),
+        });
+
+        let cancels: Arc<DashMap<String, CancellationToken>> = Arc::new(DashMap::new());
+        cancels.insert("tid".into(), cancel.clone());
+        let queue = Arc::new(EventQueue::new(EventQueueConfig::default()));
+        let slot: Arc<tokio::sync::Mutex<Option<Box<dyn AgentSession>>>> =
+            Arc::new(tokio::sync::Mutex::new(None));
+
+        run_runtime_event_loop(
+            session, "hi".into(), cancel, cancels.clone(),
+            queue.clone(), slot.clone(),
+            "sid".into(), "tid".into(), "claude".into(),
+        ).await;
+
+        assert!(prompt_called.load(Ordering::SeqCst), "prompt() was not reached");
+        assert!(disposed.load(Ordering::SeqCst), "cancelled stream-error turn did not dispose");
+        assert!(slot.lock().await.is_none(), "cancelled turn put session back");
+
+        let batch = queue.dequeue_batch(8).await;
+        assert!(
+            batch.iter().any(|env| matches!(env.event, AgenticEvent::DialogTurnCancelled { .. })),
+            "DialogTurnCancelled was not emitted"
+        );
+        assert!(
+            !batch.iter().any(|env| matches!(env.event, AgenticEvent::DialogTurnFailed { .. })),
+            "INVARIANT VIOLATED: a cancelled turn surfaced as Failed"
+        );
+        assert!(cancels.get("tid").is_none(), "cancel guard did not remove entry");
     }
 
 }
